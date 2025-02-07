@@ -437,11 +437,11 @@ def embed_snapped_polyline_map(
 ################################################################################
 
 def main():
-    st.title("Combine Largest-Cluster + IQR for Dwell Time Outliers, with Snap-to-Roads")
+    st.title("Zonar Stop Time Analysis")
 
     # 1) Provide an input box for the API key
-    st.write("**Enter your Google Maps API key (Roads API enabled):**")
-    google_maps_api_key = st.text_input("Google Roads API Key", value="", type="password")
+    st.write("**Enter Google Maps API key:**")
+    google_maps_api_key = st.text_input("Google Maps API Key", value="", type="password")
 
     # We'll store final data in session state
     if "filtered_df" not in st.session_state:
@@ -454,7 +454,7 @@ def main():
         st.session_state["r_feet_dest"]   = 200
 
     stops_file = st.file_uploader("Upload stops classification CSV", type=["csv"])
-    path_file  = st.file_uploader("Upload path data CSV", type=["csv"])
+    path_file  = st.file_uploader("Upload Zonar data CSV", type=["csv"])
 
     col1, col2 = st.columns(2)
     with col1:
@@ -468,15 +468,15 @@ def main():
     with cB:
         radius_feet_destination = st.number_input("Destination circle radius (feet)", min_value=1, value=200)
 
-    st.write("**Distance Filtering**")
-    max_distance_miles = st.number_input("Max distance (0 => cluster):", min_value=0.0, value=0.0)
-    gap_threshold_dist  = st.number_input("Gap threshold for distance cluster (if max=0)", min_value=0.0, value=0.3)
+    st.write("**Distance Filtering (experimental)**")
+    max_distance_miles = st.number_input("Max distance (leave at 0 for auto calculation):", min_value=0.0, value=0.0)
+    gap_threshold_dist  = st.number_input("Gap threshold for distance cluster (only applicable if max=0, determines the gap size between distance clusters)", min_value=0.0, value=0.3)
 
     # dwell cluster gap
     dwell_gap = st.number_input("Dwell cluster gap threshold (mins)", min_value=0.0, value=0.3)
 
     # iqr multiplier
-    iqr_multiplier = st.number_input("IQR multiplier for dwell times (1.5 typical)", min_value=0.1, value=1.5)
+    iqr_multiplier = st.number_input("IQR multiplier for dwell times (1.5 typical, increase or decrease this to include or exclude more outliers)", min_value=0.1, value=1.5)
 
     # remove top 15% travel time?
     remove_tt_15pct = st.checkbox("Remove top 15% Travel Time outliers?", value=False)
