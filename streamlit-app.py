@@ -456,11 +456,11 @@ def main():
     stops_file = st.file_uploader("Upload stops classification CSV", type=["csv"])
     path_file  = st.file_uploader("Upload Zonar data CSV", type=["csv"])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start date")
-    with col2:
-        end_date   = st.date_input("End date")
+    # col1, col2 = st.columns(2)
+    # with col1:
+    #     start_date = st.date_input("Start date")
+    # with col2:
+    #     end_date   = st.date_input("End date")
 
     cA, cB = st.columns(2)
     with cA:
@@ -502,10 +502,10 @@ def main():
             return
 
         path_df["DateTime"] = pd.to_datetime(path_df["Date"] + " " + path_df["Time(EST)"], errors="coerce")
-        if start_date and end_date and start_date <= end_date:
-            sdt = datetime.combine(start_date, datetime.min.time())
-            edt = datetime.combine(end_date, datetime.max.time())
-            path_df = path_df[ (path_df["DateTime"]>=sdt) & (path_df["DateTime"]<=edt) ]
+        # if start_date and end_date and start_date <= end_date:
+        #     sdt = datetime.combine(start_date, datetime.min.time())
+        #     edt = datetime.combine(end_date, datetime.max.time())
+        #     path_df = path_df[ (path_df["DateTime"]>=sdt) & (path_df["DateTime"]<=edt) ]
 
         path_df = path_df.sort_values(["Asset No.","DateTime"])
 
