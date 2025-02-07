@@ -676,7 +676,7 @@ def main():
 
         st.write("### Snap-to-Roads Map (Optional)")
         if google_maps_api_key == "":
-            st.warning("Please enter a valid Roads API key above.")
+            st.warning("Please enter a valid Google API key above.")
         else:
             # pick a trip
             trip_opts = []
