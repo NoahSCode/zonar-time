@@ -61,7 +61,14 @@ def analyze_stop_crossings_hashtable(
         st.error(f"Origin or Destination not found in stops data.")
         return pd.DataFrame()
 
-    df = path_df.sort_values("DateTime").copy()
+    # Create a local copy for modification to avoid side effects
+    df = path_df.copy()
+
+    # Standardize column names for predictable access
+    rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles"}
+    df.rename(columns=rename_map, inplace=True, errors='ignore')
+
+    df.sort_values("DateTime", inplace=True)
     df['in_origin_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, origin_row["Lat"], origin_row["Lon"]) <= radius_feet_origin
     df['in_dest_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, dest_row["Lat"], dest_row["Lon"]) <= radius_feet_destination
 
@@ -123,8 +130,9 @@ def analyze_stop_crossings_hashtable(
                 record = all_results_list[i]
                 if (record["Vehicle no."] == bus_id and pd.isna(record["Destination Stop Departure"]) and record["Destination Stop Entry"] == state.dest_arrival_time):
                     record["Destination Stop Departure"] = dest_depart_time_val
-                    dest_idle_mins = (dest_depart_time_val - state.dest_arrival_time).total_seconds() / 60.0
-                    record["Destination Stop Idle (mins)"] = round(dest_idle_mins, 2)
+                    if pd.notna(dest_depart_time_val) and pd.notna(record["Destination Stop Entry"]):
+                        dest_idle_mins = (dest_depart_time_val - record["Destination Stop Entry"]).total_seconds() / 60.0
+                        record["Destination Stop Idle (mins)"] = round(dest_idle_mins, 2)
                     break
             bus_states[bus_id] = BusState()
 
@@ -261,7 +269,13 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
                     c1,c2,c3 = st.columns(3); c1.metric("Slope", f"{slope:.4f}"); c2.metric("Intercept", f"{intercept:.4f}"); c3.metric("R-squared (R²)", f"{r_value**2:.4f}")
                 except Exception as e: st.warning(f"Could not calculate regression stats: {e}")
             base = alt.Chart(subset).encode(x=x_axis, y=alt.Y(f"{y_col}:Q", title=y_title, scale=alt.Scale(zero=False)))
-            points = base.mark_circle(size=60, opacity=0.7).encode(tooltip=[alt.Tooltip(c, title=c.replace(" no.", " No.").replace(" (mins)", "")) for c in ["Vehicle no.", y_col, "Time of Day Label", "O_Depart_DT"]], color=alt.Color("Vehicle no.:N", legend=None)).interactive()
+            tooltip_items = [
+                alt.Tooltip("Vehicle no.:N", title="Vehicle No."),
+                alt.Tooltip(f"{y_col}:Q", title=y_title, format=",.2f"),
+                alt.Tooltip("Time of Day Label:N", title="Time of Day"),
+                alt.Tooltip("O_Depart_DT:T", title="Departure Time", format='%Y-%m-%d %H:%M')
+            ]
+            points = base.mark_circle(size=60, opacity=0.7).encode(tooltip=tooltip_items, color=alt.Color("Vehicle no.:N", legend=None)).interactive()
             line = base.transform_regression(on="Time of Day Numeric", regression=y_col).mark_line(color="red")
             st.altair_chart((points + line).properties(height=400, title=f"Chart: {y_title} vs. Time of Day"), use_container_width=True)
 
@@ -302,7 +316,7 @@ def main():
                 for f in path_files:
                     df = pd.read_csv(f)
                     rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles", "Time(EST)": "TimeEST", "Time(EDT)": "TimeEDT"}
-                    df.rename(columns=rename_map, inplace=True)
+                    df.rename(columns=rename_map, inplace=True, errors='ignore')
                     if not set(["AssetNo", "Date", "DistanceTraveledMiles", "Lat", "Lon"]).issubset(df.columns): continue
                     time_col = "TimeEDT" if "TimeEDT" in df.columns and df["TimeEDT"].notna().any() else "TimeEST"
                     df["DateTime"] = pd.to_datetime(df["Date"] + " " + df[time_col], errors="coerce")
@@ -390,12 +404,16 @@ def main():
         }), use_container_width=True)
 
         st.subheader("Distribution Plots")
-        _plot_dist(df_final, "Travel Time", "Travel Time (minutes)", "Travel Time"); _plot_dist(df_final, "Origin Stop Idle (mins)", "Dwell Time (minutes)", "Origin Dwell")
+        _plot_dist(df_final, "Travel Time", "Travel Time (minutes)", "Travel Time")
+        _plot_dist(df_final, "Origin Stop Idle (mins)", "Dwell Time (minutes)", "Origin Dwell")
+        _plot_dist(df_final, "Destination Stop Idle (mins)", "Dwell Time (minutes)", "Destination Dwell") # ADDED
 
         st.subheader("Time of Day Scatter Plots")
         min_tod, max_tod = df_final["Time of Day Numeric"].min() - 1, df_final["Time of Day Numeric"].max() + 1
         x_axis_tod = alt.X("Time of Day Numeric:Q", title="Time of Day (Origin Departure)", scale=alt.Scale(domain=[max(0,min_tod), max_tod], clamp=True), axis=alt.Axis(labelAngle=-45, tickCount=12))
-        _plot_scatter_tod(df_final, "Travel Time", "Travel Time (mins)", x_axis_tod); _plot_scatter_tod(df_final, "Origin Stop Idle (mins)", "Origin Dwell (mins)", x_axis_tod)
+        _plot_scatter_tod(df_final, "Travel Time", "Travel Time (mins)", x_axis_tod)
+        _plot_scatter_tod(df_final, "Origin Stop Idle (mins)", "Origin Dwell (mins)", x_axis_tod)
+        _plot_scatter_tod(df_final, "Destination Stop Idle (mins)", "Destination Dwell (mins)", x_axis_tod) # ADDED
 
         st.subheader("Snap-to-Roads Map (Single Trip)")
         if not google_maps_api_key: st.warning("Enter a Google Maps API Key to enable map feature.")
@@ -408,7 +426,7 @@ def main():
                     chosen_row = df_final.loc[chosen_idx]
                     start, end = pd.to_datetime(chosen_row["Last Ping In Origin DateTime"]), pd.to_datetime(chosen_row["Destination Stop Entry"])
                     if pd.notna(start) and pd.notna(end):
-                        pings = path_analysis_df[(path_analysis_df["AssetNo"] == chosen_row["Vehicle no."]) & (path_analysis_df["DateTime"].between(start, end))].sort_values("DateTime")
+                        pings = st.session_state.path_df[(st.session_state.path_df["AssetNo"] == chosen_row["Vehicle no."]) & (st.session_state.path_df["DateTime"].between(start, end))].sort_values("DateTime")
                         coords = list(zip(pings["Lat"], pings["Lon"]))
                         if coords:
                             with st.spinner("Snapping to roads..."): snapped = snap_to_roads(coords, google_maps_api_key)
