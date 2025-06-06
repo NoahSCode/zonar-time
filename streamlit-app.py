@@ -61,19 +61,21 @@ def analyze_stop_crossings_hashtable(
         st.error(f"Origin or Destination not found in stops data.")
         return pd.DataFrame()
 
-    # Create a local copy for modification to avoid side effects
+    # The incoming path_df is already filtered by date, but it's large.
+    # Create a working copy with only the columns needed for this analysis.
     df = path_df.copy()
 
-    # Standardize column names for predictable access
+    # Rename columns for easier access (already done at load time, but safe to keep)
     rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles"}
     df.rename(columns=rename_map, inplace=True, errors='ignore')
-
+    
     df.sort_values("DateTime", inplace=True)
     df['in_origin_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, origin_row["Lat"], origin_row["Lon"]) <= radius_feet_origin
     df['in_dest_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, dest_row["Lat"], dest_row["Lon"]) <= radius_feet_destination
 
     bus_states, all_results_list = {}, []
 
+    # Using itertuples is memory and speed efficient
     for ping in df.itertuples(index=False):
         bus_id, curr_datetime = ping.AssetNo, ping.DateTime
         curr_in_origin, curr_in_dest = ping.in_origin_zone, ping.in_dest_zone
@@ -248,6 +250,7 @@ def _check_empty_and_stop(df: pd.DataFrame, filter_name: str) -> bool:
     return False
 
 def _safe_round(val, decimals=2):
+    """Safely rounds a number, returning 'N/A' for non-numeric or NaN inputs."""
     return round(float(val), decimals) if isinstance(val, (int, float, np.number)) and pd.notnull(val) else "N/A"
 
 def _plot_dist(df: pd.DataFrame, col_name: str, title_x: str, base_title: str):
@@ -310,27 +313,53 @@ def main():
         except Exception as e: st.error(f"Error loading stops CSV(s): {e}"); st.session_state.stops_df, st.session_state.processed_stops_files = pd.DataFrame(), None
 
     if path_files and path_files != st.session_state.processed_path_files:
+        # --- MEMORY OPTIMIZATION 1: Define required columns and efficient data types ---
+        # Only load the columns we actually use to dramatically reduce memory footprint.
+        REQUIRED_PATH_COLS = {
+            "Asset No.", "Date", "Time(EST)", "Time(EDT)",
+            "Lat", "Lon", "Distance Traveled(Miles)"
+        }
+        # Use more memory-efficient types. float32 is sufficient for lat/lon.
+        PATH_DTYPES = {
+            "Asset No.": "category",
+            "Lat": "float32",
+            "Lon": "float32",
+            "Distance Traveled(Miles)": "float32"
+        }
+        
         dfs = []
         try:
-            with st.spinner(f"Loading data from {len(path_files)} file(s)..."):
+            with st.spinner(f"Loading and optimizing data from {len(path_files)} file(s)..."):
                 for f in path_files:
-                    df = pd.read_csv(f)
+                    # Use a lambda for usecols to safely ignore missing columns in a file
+                    df = pd.read_csv(f, usecols=lambda c: c in REQUIRED_PATH_COLS, dtype=PATH_DTYPES)
+                    
+                    # Rename columns for consistency
                     rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles", "Time(EST)": "TimeEST", "Time(EDT)": "TimeEDT"}
                     df.rename(columns=rename_map, inplace=True, errors='ignore')
-                    if not set(["AssetNo", "Date", "DistanceTraveledMiles", "Lat", "Lon"]).issubset(df.columns): continue
+
+                    if not set(["AssetNo", "Date", "DistanceTraveledMiles", "Lat", "Lon"]).issubset(df.columns):
+                        st.warning(f"Skipping file {f.name} as it's missing required columns.")
+                        continue
+                    
+                    # More robustly find the correct time column to use
                     time_col = "TimeEDT" if "TimeEDT" in df.columns and df["TimeEDT"].notna().any() else "TimeEST"
                     df["DateTime"] = pd.to_datetime(df["Date"] + " " + df[time_col], errors="coerce")
                     df.dropna(subset=["DateTime"], inplace=True)
                     dfs.append(df)
+
             if dfs:
                 combined_df = pd.concat(dfs, ignore_index=True)
-                for col, dtype in {"AssetNo": "category", "Lat": "float64", "Lon": "float64", "DistanceTraveledMiles": "float32"}.items(): combined_df[col] = combined_df[col].astype(dtype)
-                st.session_state.raw_path_df = combined_df[["AssetNo", "DateTime", "DistanceTraveledMiles", "Lat", "Lon"]]
+                st.session_state.raw_path_df = combined_df
                 st.session_state.processed_path_files = path_files
+                # Reset downstream states
                 st.session_state.path_df, st.session_state.filtered_df = pd.DataFrame(), pd.DataFrame()
                 st.session_state.start_date_filter, st.session_state.end_date_filter = None, None
-                st.success(f"Loaded {len(combined_df)} path records from {len(dfs)} valid file(s)."); st.rerun()
-        except Exception as e: st.error(f"Error loading path CSV(s): {e}"); st.session_state.raw_path_df, st.session_state.processed_path_files = pd.DataFrame(), None
+                st.success(f"Loaded and optimized {len(combined_df)} path records from {len(dfs)} valid file(s).")
+                st.rerun() # Rerun to update date pickers etc.
+        except Exception as e:
+            st.error(f"Error loading path CSV(s): {e}")
+            st.session_state.raw_path_df, st.session_state.processed_path_files = pd.DataFrame(), None
 
     if not st.session_state.raw_path_df.empty:
         df_filter = st.session_state.raw_path_df
@@ -343,9 +372,13 @@ def main():
         if s_filt and e_filt:
             st.session_state.start_date_filter, st.session_state.end_date_filter = s_filt, e_filt
             if s_filt <= e_filt:
-                st.session_state.path_df = df_filter[(df_filter["DateTime"] >= datetime.combine(s_filt, time.min)) & (df_filter["DateTime"] <= datetime.combine(e_filt, time.max))].copy()
+                # --- MEMORY OPTIMIZATION 2: Avoid .copy() where a view is sufficient ---
+                # The result of this boolean indexing is what we'll use, no need to force a copy yet.
+                st.session_state.path_df = df_filter[(df_filter["DateTime"] >= datetime.combine(s_filt, time.min)) & (df_filter["DateTime"] <= datetime.combine(e_filt, time.max))]
                 st.sidebar.success(f"{len(st.session_state.path_df)} records in range.")
-            else: st.sidebar.error("Start date must be before end date."); st.session_state.path_df = pd.DataFrame()
+            else:
+                st.sidebar.error("Start date must be before end date.")
+                st.session_state.path_df = pd.DataFrame()
 
     stops_ui, path_analysis_df = st.session_state.stops_df, st.session_state.path_df
     if not stops_ui.empty and not path_analysis_df.empty:
@@ -369,7 +402,7 @@ def main():
         if st.button("🚀 Analyze Stop Crossings", type="primary", use_container_width=True):
             if origin_stop_info["Stop Name"] == dest_stop_info["Stop Name"]: st.error("Origin and Destination must be different.")
             else:
-                with st.spinner("Analyzing..."):
+                with st.spinner("Analyzing... This may take a moment for large datasets."):
                     df = analyze_stop_crossings_hashtable(stops_ui, path_analysis_df, origin_stop_info["Stop Name"], dest_stop_info["Stop Name"], r_orig, r_dest, op_day_cutoff_hour_config)
                 if df.empty: st.warning("No trips found."); st.session_state.filtered_df = pd.DataFrame(); return
 
@@ -398,27 +431,42 @@ def main():
         st.dataframe(disp_copy.drop(columns=["O_Depart_DT", "Travel Date_dt", "Time of Day Numeric"], errors='ignore'), use_container_width=True)
 
         st.subheader("Summary Metrics")
-        st.dataframe(pd.DataFrame({
-            "Metric": ["Total Trips", "Distinct Vehicles", "Avg Origin Dwell", "Avg Dest Dwell", "Avg Distance", "Avg Travel Time"],
-            "Value": [len(df_final), df_final["Vehicle no."].nunique(), f"{_safe_round(df_final['Origin Stop Idle (mins)'].mean())} min", f"{_safe_round(df_final['Destination Stop Idle (mins)'].mean())} min", f"{_safe_round(df_final['Actual Distance (miles)'].mean(), 3)} mi", f"{_safe_round(df_final['Travel Time'].mean())} min"]
-        }), use_container_width=True)
+        # --- ROBUSTNESS FIX ---
+        # Use st.metric for clear, robust display of key values. This avoids crashes
+        # if filters result in an empty dataframe, as .mean() would return NaN.
+        col1, col2, col3 = st.columns(3)
+        col4, col5, col6 = st.columns(3)
+
+        col1.metric("Total Trips", len(df_final))
+        col2.metric("Distinct Vehicles", df_final["Vehicle no."].nunique())
+        col3.metric("Avg Travel Time (min)", _safe_round(df_final['Travel Time'].mean()))
+        col4.metric("Avg Distance (mi)", _safe_round(df_final['Actual Distance (miles)'].mean(), 3))
+        col5.metric("Avg Origin Dwell (min)", _safe_round(df_final['Origin Stop Idle (mins)'].mean()))
+        col6.metric("Avg Dest Dwell (min)", _safe_round(df_final['Destination Stop Idle (mins)'].mean()))
+
 
         st.subheader("Distribution Plots")
-        _plot_dist(df_final, "Travel Time", "Travel Time (minutes)", "Travel Time")
-        _plot_dist(df_final, "Origin Stop Idle (mins)", "Dwell Time (minutes)", "Origin Dwell")
-        _plot_dist(df_final, "Destination Stop Idle (mins)", "Dwell Time (minutes)", "Destination Dwell") # ADDED
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _plot_dist(df_final, "Travel Time", "Travel Time (minutes)", "Travel Time")
+        with c2:
+            _plot_dist(df_final, "Origin Stop Idle (mins)", "Dwell Time (minutes)", "Origin Dwell")
+        with c3:
+            _plot_dist(df_final, "Destination Stop Idle (mins)", "Dwell Time (minutes)", "Destination Dwell")
 
         st.subheader("Time of Day Scatter Plots")
-        min_tod, max_tod = df_final["Time of Day Numeric"].min() - 1, df_final["Time of Day Numeric"].max() + 1
-        x_axis_tod = alt.X("Time of Day Numeric:Q", title="Time of Day (Origin Departure)", scale=alt.Scale(domain=[max(0,min_tod), max_tod], clamp=True), axis=alt.Axis(labelAngle=-45, tickCount=12))
-        _plot_scatter_tod(df_final, "Travel Time", "Travel Time (mins)", x_axis_tod)
-        _plot_scatter_tod(df_final, "Origin Stop Idle (mins)", "Origin Dwell (mins)", x_axis_tod)
-        _plot_scatter_tod(df_final, "Destination Stop Idle (mins)", "Destination Dwell (mins)", x_axis_tod) # ADDED
+        if not df_final["Time of Day Numeric"].dropna().empty:
+            min_tod, max_tod = df_final["Time of Day Numeric"].min() - 1, df_final["Time of Day Numeric"].max() + 1
+            x_axis_tod = alt.X("Time of Day Numeric:Q", title="Time of Day (Origin Departure)", scale=alt.Scale(domain=[max(0,min_tod), max_tod], clamp=True), axis=alt.Axis(labelAngle=-45, tickCount=12))
+            _plot_scatter_tod(df_final, "Travel Time", "Travel Time (mins)", x_axis_tod)
+            _plot_scatter_tod(df_final, "Origin Stop Idle (mins)", "Origin Dwell (mins)", x_axis_tod)
+            _plot_scatter_tod(df_final, "Destination Stop Idle (mins)", "Destination Dwell (mins)", x_axis_tod)
 
         st.subheader("Snap-to-Roads Map (Single Trip)")
         if not google_maps_api_key: st.warning("Enter a Google Maps API Key to enable map feature.")
         else:
-            options = [f"Trip (Idx {r.Index}) | Bus: {r._1} | Travel: {r._12:.1f}m" for r in df_final.head(100).itertuples()]
+            # Use head(100) to prevent creating a massive list for the selectbox on huge result sets
+            options = [f"Trip (Idx {r.Index}) | Bus: {getattr(r, 'Vehicle no.')} | Travel: {getattr(r, 'Travel Time'):.1f}m" for r in df_final.head(100).itertuples()]
             if options:
                 choice_label = st.selectbox("Select trip to display (first 100):", options)
                 if choice_label:
@@ -426,13 +474,20 @@ def main():
                     chosen_row = df_final.loc[chosen_idx]
                     start, end = pd.to_datetime(chosen_row["Last Ping In Origin DateTime"]), pd.to_datetime(chosen_row["Destination Stop Entry"])
                     if pd.notna(start) and pd.notna(end):
-                        pings = st.session_state.path_df[(st.session_state.path_df["AssetNo"] == chosen_row["Vehicle no."]) & (st.session_state.path_df["DateTime"].between(start, end))].sort_values("DateTime")
+                        # Filter the original, raw dataframe for pings to avoid re-calculating anything
+                        pings = st.session_state.raw_path_df[
+                            (st.session_state.raw_path_df["AssetNo"] == chosen_row["Vehicle no."]) & 
+                            (st.session_state.raw_path_df["DateTime"].between(start, end))
+                        ].sort_values("DateTime")
                         coords = list(zip(pings["Lat"], pings["Lon"]))
                         if coords:
-                            with st.spinner("Snapping to roads..."): snapped = snap_to_roads(coords, google_maps_api_key)
+                            with st.spinner("Snapping to roads..."):
+                                snapped = snap_to_roads(coords, google_maps_api_key)
                             embed_snapped_polyline_map(coords, snapped, origin_stop_info, dest_stop_info, r_orig, r_dest, google_maps_api_key)
-                        else: st.warning("No GPS pings found for the selected trip segment.")
-                    else: st.warning("Trip missing timestamps for map.")
+                        else:
+                            st.warning("No GPS pings found for the selected trip segment.")
+                    else:
+                        st.warning("Trip missing timestamps for map.")
 
 if __name__ == "__main__":
     main()
