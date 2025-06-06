@@ -1,16 +1,46 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date, time # Added 'time'
+from datetime import datetime, timedelta, date, time
 import altair as alt
 import requests
 import streamlit.components.v1 as components
 from scipy.stats import linregress
-# math imports (radians, sin, cos, sqrt, atan2) are not explicitly needed at the top level
-# as np provides vectorized versions.
+from dataclasses import dataclass, field # Import dataclass for state management
 
 ################################################################################
-# 1) Utility: Haversine & Circle checks (Optimized for vectorized use)
+# 0) NEW: Data Class for State Management
+################################################################################
+@dataclass
+class BusState:
+    """
+    A dataclass to hold the state of a single bus during chronological processing.
+    This acts as the 'value' in our bus_id -> state hash table.
+    """
+    # Trip state flags
+    inside_origin: bool = False
+    inside_dest: bool = False
+
+    # Key timestamps for the current in-progress trip
+    origin_arrival_time: pd.Timestamp = pd.NaT
+    origin_depart_time: pd.Timestamp = pd.NaT
+    dest_arrival_time: pd.Timestamp = pd.NaT
+
+    # Data from the *previous* ping for this specific bus, needed for transitions
+    prev_datetime: pd.Timestamp = pd.NaT
+    prev_in_origin_zone: bool = False
+    prev_in_dest_zone: bool = False
+    prev_dist_traveled: float = np.nan
+
+    # To track the start of the trip for distance calculation
+    origin_depart_start_dist: float = np.nan
+    
+    # Store the actual last ping time inside the origin for more accurate map plotting
+    last_ping_in_origin_dt_current_trip: pd.Timestamp = pd.NaT
+
+
+################################################################################
+# 1) Utility: Haversine & Circle checks (Unchanged)
 ################################################################################
 EARTH_RADIUS_FEET = 20902231  # Earth's approximate radius in feet
 
@@ -35,139 +65,25 @@ def interpolate_time(t1: pd.Timestamp, t2: pd.Timestamp) -> pd.Timestamp | None:
     Interpolate the midpoint time between two timestamps.
     Returns None if either timestamp is NaT or None.
     """
-    if pd.isna(t1) or pd.isna(t2): # Simplified check for NaT or None
+    if pd.isna(t1) or pd.isna(t2):
         return None
-    # Ensure t1 and t2 are timestamps if they are not already (e.g. datetime objects)
     t1 = pd.Timestamp(t1)
     t2 = pd.Timestamp(t2)
     midpoint = t1 + (t2 - t1) / 2
     return midpoint.replace(microsecond=0)
 
 ################################################################################
-# 2) Ping-Based Stop Crossing Analysis (Refactored)
+# 2) OPTIMIZED Ping-Based Stop Crossing Analysis (Hash Table Implementation)
 ################################################################################
-def _process_single_bus(
-    bus_df_original: pd.DataFrame, bus_id: str,
-    origin_stop_name: str, origin_lat: float, origin_lon: float, radius_feet_origin: float,
-    dest_stop_name: str, dest_lat: float, dest_lon: float, radius_feet_destination: float,
-    op_day_cutoff_hour: int = 3
-) -> list[dict]:
-    """
-    Processes pings for a single bus to identify stop crossings and calculate metrics.
-    """
-    bus_df = bus_df_original.copy() # Work on a copy
-    if len(bus_df) < 2:
-        return []
-
-    bus_df['dist_to_origin'] = haversine_distance_vectorized(bus_df["Lat"].values, bus_df["Lon"].values, origin_lat, origin_lon)
-    bus_df['in_origin_zone'] = bus_df['dist_to_origin'] <= radius_feet_origin
-    bus_df['dist_to_dest'] = haversine_distance_vectorized(bus_df["Lat"].values, bus_df["Lon"].values, dest_lat, dest_lon)
-    bus_df['in_dest_zone'] = bus_df['dist_to_dest'] <= radius_feet_destination
-
-    datetime_vals = bus_df["DateTime"].values
-    in_origin_zone_vals = bus_df['in_origin_zone'].values
-    in_dest_zone_vals = bus_df['in_dest_zone'].values
-    distance_traveled_vals = bus_df["Distance Traveled(Miles)"].values
-
-    results_for_bus = []
-    inside_origin, inside_dest = False, False
-    origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
-    last_ping_in_origin_dt_current_trip = pd.NaT # ADDED: To store the last ping time inside origin for the current trip
-    origin_depart_ping_idx = -1
-
-    for i in range(len(bus_df) - 1):
-        curr_datetime = pd.Timestamp(datetime_vals[i])
-        c_in_ori = in_origin_zone_vals[i]
-        c_in_dst = in_dest_zone_vals[i]
-
-        nxt_datetime = pd.Timestamp(datetime_vals[i+1])
-        n_in_ori = in_origin_zone_vals[i+1]
-        n_in_dst = in_dest_zone_vals[i+1]
-
-        if not inside_origin and c_in_ori:
-            inside_origin = True
-            origin_arrival_time = curr_datetime
-        
-        if inside_origin and c_in_ori and not n_in_ori:
-            inside_origin = False
-            origin_depart_time = interpolate_time(curr_datetime, nxt_datetime)
-            last_ping_in_origin_dt_current_trip = curr_datetime # MODIFIED: Store this specific ping time
-            origin_depart_ping_idx = i + 1
-
-        if not pd.isna(origin_depart_time) and not inside_dest and c_in_dst:
-            if curr_datetime < origin_depart_time:
-                continue
-            
-            inside_dest = True
-            dest_arrival_time = curr_datetime
-            
-            actual_distance = 0.0
-            if origin_depart_ping_idx != -1 and i >= origin_depart_ping_idx:
-                dist_start = distance_traveled_vals[origin_depart_ping_idx -1] 
-                dist_end = distance_traveled_vals[i]
-                if pd.notna(dist_start) and pd.notna(dist_end):
-                    actual_distance = dist_end - dist_start
-            
-            origin_idle_mins = 0.0
-            if pd.notna(origin_arrival_time) and pd.notna(origin_depart_time):
-                origin_idle_mins = (origin_depart_time - origin_arrival_time).total_seconds() / 60.0
-            
-            travel_time_mins = 0.0
-            if pd.notna(origin_depart_time) and pd.notna(dest_arrival_time):
-                travel_time_mins = (dest_arrival_time - origin_depart_time).total_seconds() / 60.0
-            
-            if travel_time_mins < 0: travel_time_mins = 0.0
-
-            travel_date_to_format = None
-            if pd.notnull(origin_depart_time):
-                event_dt = origin_depart_time
-                if event_dt.hour < op_day_cutoff_hour:
-                    travel_date_to_format = event_dt.date() - timedelta(days=1)
-                else:
-                    travel_date_to_format = event_dt.date()
-            travel_date_str = travel_date_to_format.strftime("%m/%d/%Y") if travel_date_to_format else None
-
-            results_for_bus.append({
-                "Vehicle no.": bus_id, "Travel Date": travel_date_str,
-                "Origin Stop": origin_stop_name, "Destination Stop": dest_stop_name,
-                "Origin Stop Arrival": origin_arrival_time,
-                "Origin Stop Departure": origin_depart_time,
-                "Last Ping In Origin DateTime": last_ping_in_origin_dt_current_trip, # ADDED: Include in results
-                "Origin Stop Idle (mins)": round(origin_idle_mins, 2),
-                "Destination Stop Entry": dest_arrival_time,
-                "Destination Stop Departure": pd.NaT,
-                "Destination Stop Idle (mins)": None,
-                "Actual Distance (miles)": round(actual_distance, 3),
-                "Travel Time": round(travel_time_mins, 2)
-            })
-
-        if inside_dest and c_in_dst and not n_in_dst:
-            inside_dest = False
-            dest_depart_time_val = interpolate_time(curr_datetime, nxt_datetime)
-
-            if results_for_bus:
-                last_record = results_for_bus[-1]
-                if (last_record["Vehicle no."] == bus_id and
-                    pd.isna(last_record["Destination Stop Departure"]) and
-                    last_record["Destination Stop Entry"] == dest_arrival_time):
-                    last_record["Destination Stop Departure"] = dest_depart_time_val
-                    dest_idle_mins = 0.0
-                    if pd.notna(dest_arrival_time) and pd.notna(dest_depart_time_val):
-                        dest_idle_mins = (dest_depart_time_val - dest_arrival_time).total_seconds() / 60.0
-                    last_record["Destination Stop Idle (mins)"] = round(dest_idle_mins, 2)
-
-            origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
-            last_ping_in_origin_dt_current_trip = pd.NaT # MODIFIED: Reset for next trip
-            origin_depart_ping_idx = -1
-    return results_for_bus
-
-def analyze_stop_crossings(
+def analyze_stop_crossings_hashtable(
     stops_df: pd.DataFrame, path_df: pd.DataFrame, origin_stop: str, destination_stop: str,
     radius_feet_origin: float = 200, radius_feet_destination: float = 200,
     op_day_cutoff_hour: int = 3
 ) -> pd.DataFrame:
     """
-    Analyzes stop crossings for all buses between a specified origin and destination.
+    Analyzes stop crossings using a single chronological pass over all pings,
+    managing state for each bus in a hash table (dictionary). This avoids
+    the overhead of pandas groupby and is more scalable.
     """
     if stops_df.empty or path_df.empty:
         return pd.DataFrame()
@@ -179,41 +95,147 @@ def analyze_stop_crossings(
         st.error(f"Origin '{origin_stop}' or Destination '{destination_stop}' not found in stops data.")
         return pd.DataFrame()
 
-    all_results_list = []
-    for bus_id_val, bus_data_group in path_df.groupby("Asset No.", sort=False):
-        current_bus_results = _process_single_bus(
-            bus_data_group, bus_id_val,
-            origin_stop, origin_row["Lat"], origin_row["Lon"], radius_feet_origin,
-            destination_stop, dest_row["Lat"], dest_row["Lon"], radius_feet_destination,
-            op_day_cutoff_hour=op_day_cutoff_hour
-        )
-        if current_bus_results:
-            all_results_list.extend(current_bus_results)
+    # --- Pre-computation Step ---
+    # 1. Sort the entire dataframe by time. This is the key to the single-pass approach.
+    df = path_df.sort_values("DateTime").copy()
 
+    # 2. Vectorized calculation of distances and zone checks for all pings at once.
+    df['in_origin_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, origin_row["Lat"], origin_row["Lon"]) <= radius_feet_origin
+    df['in_dest_zone'] = haversine_distance_vectorized(df["Lat"].values, df["Lon"].values, dest_row["Lat"], dest_row["Lon"]) <= radius_feet_destination
+
+    # --- Hash Table and Iteration Step ---
+    bus_states = {}  # The hash table: {bus_id: BusState}
+    all_results_list = []
+
+    # Iterate through each ping in chronological order. itertuples is much faster than iterrows.
+    for ping in df.itertuples():
+        bus_id = ping._asdict().get("Asset No.") # Use ._asdict() for robust column name access
+        curr_datetime = ping.DateTime
+        curr_in_origin = ping.in_origin_zone
+        curr_in_dest = ping.in_dest_zone
+        curr_dist_traveled = getattr(ping, "Distance Traveled(Miles)", np.nan)
+
+        # Get the state for the current bus. If it's the first time we see this bus, create a new state.
+        state = bus_states.get(bus_id)
+        if state is None:
+            state = BusState()
+            bus_states[bus_id] = state
+
+        # --- State Machine Logic (applied to each ping) ---
+        # A bus has entered the origin zone for the first time on a trip.
+        if not state.inside_origin and curr_in_origin:
+            state.inside_origin = True
+            state.origin_arrival_time = curr_datetime
+        
+        # A bus has just left the origin zone. This marks the departure.
+        # This requires knowing the state of the *previous* ping for this bus.
+        if state.inside_origin and state.prev_in_origin_zone and not curr_in_origin:
+            state.inside_origin = False
+            state.origin_depart_time = interpolate_time(state.prev_datetime, curr_datetime)
+            # Store the distance reading at the start of the trip segment
+            state.origin_depart_start_dist = state.prev_dist_traveled
+            # Keep the last *actual* ping time inside the zone for map visualization
+            state.last_ping_in_origin_dt_current_trip = state.prev_datetime
+
+        # A bus has entered the destination zone for the first time *after* departing the origin.
+        if not pd.isna(state.origin_depart_time) and not state.inside_dest and curr_in_dest:
+            # Ignore entries into destination that happen before the official origin departure time
+            if curr_datetime < state.origin_depart_time:
+                # Update previous state and continue to the next ping
+                state.prev_datetime = curr_datetime
+                state.prev_in_origin_zone = curr_in_origin
+                state.prev_in_dest_zone = curr_in_dest
+                state.prev_dist_traveled = curr_dist_traveled
+                continue
+
+            state.inside_dest = True
+            state.dest_arrival_time = curr_datetime
+            
+            # Calculate metrics for the completed trip leg
+            actual_distance = 0.0
+            if pd.notna(state.origin_depart_start_dist) and pd.notna(curr_dist_traveled):
+                actual_distance = curr_dist_traveled - state.origin_depart_start_dist
+            
+            origin_idle_mins = (state.origin_depart_time - state.origin_arrival_time).total_seconds() / 60.0
+            travel_time_mins = (state.dest_arrival_time - state.origin_depart_time).total_seconds() / 60.0
+
+            # Assign to an operational day
+            travel_date_str = None
+            if pd.notnull(state.origin_depart_time):
+                event_dt = state.origin_depart_time
+                travel_date_to_format = event_dt.date() - timedelta(days=1) if event_dt.hour < op_day_cutoff_hour else event_dt.date()
+                travel_date_str = travel_date_to_format.strftime("%m/%d/%Y")
+
+            # Append the result
+            all_results_list.append({
+                "Vehicle no.": bus_id, "Travel Date": travel_date_str,
+                "Origin Stop": origin_stop, "Destination Stop": destination_stop,
+                "Origin Stop Arrival": state.origin_arrival_time,
+                "Origin Stop Departure": state.origin_depart_time,
+                "Last Ping In Origin DateTime": state.last_ping_in_origin_dt_current_trip,
+                "Origin Stop Idle (mins)": round(origin_idle_mins, 2),
+                "Destination Stop Entry": state.dest_arrival_time,
+                "Destination Stop Departure": pd.NaT, # To be filled in later
+                "Destination Stop Idle (mins)": None,
+                "Actual Distance (miles)": round(actual_distance, 3) if actual_distance >= 0 else 0,
+                "Travel Time": round(travel_time_mins, 2) if travel_time_mins >=0 else 0
+            })
+
+        # A bus has just left the destination zone, completing the full stop.
+        if state.inside_dest and state.prev_in_dest_zone and not curr_in_dest:
+            state.inside_dest = False
+            dest_depart_time_val = interpolate_time(state.prev_datetime, curr_datetime)
+
+            # Find the last record for this bus and update its departure/idle time.
+            if all_results_list:
+                last_record = all_results_list[-1]
+                if (last_record["Vehicle no."] == bus_id and
+                    pd.isna(last_record["Destination Stop Departure"]) and
+                    last_record["Destination Stop Entry"] == state.dest_arrival_time):
+                    
+                    last_record["Destination Stop Departure"] = dest_depart_time_val
+                    dest_idle_mins = (dest_depart_time_val - state.dest_arrival_time).total_seconds() / 60.0
+                    last_record["Destination Stop Idle (mins)"] = round(dest_idle_mins, 2)
+
+            # Reset the state for this bus to be ready for a new trip from origin->dest.
+            state = BusState()
+            bus_states[bus_id] = state
+
+        # --- Update State ---
+        # At the end of the loop for each ping, update the 'previous' state holder.
+        state.prev_datetime = curr_datetime
+        state.prev_in_origin_zone = curr_in_origin
+        state.prev_in_dest_zone = curr_in_dest
+        state.prev_dist_traveled = curr_dist_traveled
+        # If the bus is currently in the origin, keep updating the last known ping time inside.
+        if state.inside_origin and curr_in_origin:
+             state.last_ping_in_origin_dt_current_trip = curr_datetime
+
+    # --- Finalization Step ---
     if not all_results_list:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_results_list)
-
+    results_df = pd.DataFrame(all_results_list)
     datetime_cols = [
-        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
         "Destination Stop Entry", "Destination Stop Departure"
     ]
     for col in datetime_cols:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
+        if col in results_df.columns:
+            results_df[col] = pd.to_datetime(results_df[col], errors='coerce')
     
     final_cols_ordered = [
         "Vehicle no.", "Travel Date", "Origin Stop", "Destination Stop",
-        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
         "Origin Stop Idle (mins)",
         "Destination Stop Entry", "Destination Stop Departure", "Destination Stop Idle (mins)",
         "Actual Distance (miles)", "Travel Time"
     ]
-    return df[[col for col in final_cols_ordered if col in df.columns]]
+    return results_df[[col for col in final_cols_ordered if col in results_df.columns]]
+
 
 ################################################################################
-# 3) Distance Filter, 4) Idle Largest Cluster, 5) Idle IQR (Largely Unchanged)
+# 3) Distance Filter, 4) Idle Largest Cluster, 5) Idle IQR (Unchanged)
 ################################################################################
 def filter_by_gap_clustering_largest(df: pd.DataFrame, gap_threshold: float = 0.3) -> pd.DataFrame:
     if df.empty or "Actual Distance (miles)" not in df.columns:
@@ -409,7 +431,7 @@ def embed_snapped_polyline_map(
     components.html(html_code, height=600)
 
 ################################################################################
-# 7) Main App
+# 7) Main App (and helper functions)
 ################################################################################
 
 def calculate_time_of_day_adjusted_vectorized(s_depart_dt: pd.Series, s_travel_date_dt: pd.Series) -> pd.Series:
@@ -480,7 +502,7 @@ def format_time_of_day_label(time_val_24hr: float) -> str:
 
 def main():
     st.set_page_config(layout="wide") 
-    st.title("Zonar Stop Time Analysis")
+    st.title("Zonar Stop Time Analysis (Optimized)")
 
     st.sidebar.header("Analysis Configuration")
     op_day_cutoff_hour_config = st.sidebar.number_input(
@@ -553,7 +575,9 @@ def main():
                 path_df_loaded["Lon"] = path_df_loaded["Lon"].astype("float64")
                 path_df_loaded["Distance Traveled(Miles)"] = path_df_loaded["Distance Traveled(Miles)"].astype("float32")
                 
-                st.session_state["raw_path_df"] = path_df_loaded.sort_values(["Asset No.", "DateTime"]).reset_index(drop=True)[
+                # NOTE: Sorting is now done inside the analysis function, so it's not strictly needed here anymore,
+                # but can be kept for consistency if desired.
+                st.session_state["raw_path_df"] = path_df_loaded[
                     ["Asset No.", "DateTime", "Distance Traveled(Miles)", "Lat", "Lon"]
                 ]
                 st.success(f"Loaded {len(st.session_state['raw_path_df'])} path records.")
@@ -648,8 +672,10 @@ def main():
             if actual_origin_stop_name == actual_dest_stop_name:
                 st.error("Origin and Destination stops cannot be the same.")
             else:
-                with st.spinner("Analyzing stop crossings... This may take a moment."):
-                    res_df = analyze_stop_crossings(
+                with st.spinner("Analyzing stop crossings with optimized hash table method..."):
+                    # *** THIS IS THE ONLY LINE THAT CHANGES in main() ***
+                    # We call the new, optimized function instead of the old one.
+                    res_df = analyze_stop_crossings_hashtable(
                         stops_ui, path_analysis_df,
                         actual_origin_stop_name, actual_dest_stop_name,
                         r_orig_val, r_dest_val,
@@ -725,7 +751,7 @@ def main():
         
         disp_copy = display_df_final.copy()
         dt_display_cols = [
-            "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+            "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
             "Destination Stop Entry", "Destination Stop Departure"
         ]
         for c in dt_display_cols:
@@ -794,7 +820,6 @@ def main():
         elif not display_df_final.empty:
             map_options_list = []
             map_df_selection = display_df_final.copy()
-            # MODIFIED: Prepare the new column for map ping start time
             map_df_selection["Last Ping In Origin DateTime_map"] = pd.to_datetime(
                 map_df_selection["Last Ping In Origin DateTime"], errors='coerce'
             )
@@ -811,7 +836,6 @@ def main():
                     chosen_original_idx = next(o[1] for o in map_options_list if o[0] == choice_label)
                     chosen_row = map_df_selection.loc[chosen_original_idx]
                     
-                    # MODIFIED: Use "Last Ping In Origin DateTime_map" for ping start
                     ping_start_time_for_map = chosen_row.get("Last Ping In Origin DateTime_map", pd.NaT)
                     d_arrival_dt_map = chosen_row.get("D_Arrival_DT_map", pd.NaT)
 
@@ -826,7 +850,7 @@ def main():
                         else:
                             bus_trip_pings = path_for_map_df[
                                 (path_for_map_df["Asset No."] == chosen_row["Vehicle no."]) &
-                                (path_for_map_df["DateTime"] >= ping_start_time_for_map) & # MODIFIED: Use new start time
+                                (path_for_map_df["DateTime"] >= ping_start_time_for_map) &
                                 (path_for_map_df["DateTime"] <= d_arrival_dt_map) 
                             ].copy()
                             
@@ -907,35 +931,19 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
         subset_df_scatter.dropna(subset=required_cols, inplace=True) 
         
         if not subset_df_scatter.empty:
-            # Section title
             st.write(f"#### {y_title} vs. Time of Day")
 
-            # --- Calculate and Display Regression Statistics using SciPy ---
-            x_values = subset_df_scatter["Time of Day Numeric"].values
-            y_values = subset_df_scatter[y_col].values
-
-            if len(x_values) >= 2 and len(y_values) >= 2: # Need at least 2 points for linregress
+            if len(subset_df_scatter["Time of Day Numeric"].unique()) >= 2 and len(subset_df_scatter[y_col].unique()) >= 2:
                 try:
-                    # Perform linear regression
-                    slope, intercept, r_value, p_value, std_err = linregress(x_values, y_values)
-                    r_squared = r_value**2
-
-                    # Display statistics using st.metric in columns
+                    slope, intercept, r_value, p_value, std_err = linregress(subset_df_scatter["Time of Day Numeric"], subset_df_scatter[y_col])
                     st.markdown("**Regression Statistics:**")
                     stat_col1, stat_col2, stat_col3 = st.columns(3)
                     stat_col1.metric(label="Slope", value=f"{slope:.4f}")
                     stat_col2.metric(label="Intercept", value=f"{intercept:.4f}")
-                    stat_col3.metric(label="R-squared (R²)", value=f"{r_squared:.4f}")
-                
-                except ValueError as ve: # Handle cases where linregress might fail (e.g., all x_values are the same)
-                    st.warning(f"Could not calculate regression statistics for {y_title}: {ve}. Not enough distinct data points.")
-                except Exception as e: # Catch any other unexpected errors during regression
-                    st.error(f"An error occurred during regression calculation for {y_title}: {e}")
-            else:
-                st.write(f"Not enough data points (found {len(x_values)}, need at least 2) to calculate regression statistics for {y_title}.")
-            # --- End of Statistics Calculation and Display ---
+                    stat_col3.metric(label="R-squared (R²)", value=f"{r_value**2:.4f}")
+                except Exception as e:
+                    st.warning(f"Could not calculate regression statistics for {y_title}: {e}")
 
-            # Tooltip for individual scatter points (remains the same)
             point_tooltip_items = [
                 alt.Tooltip("Vehicle no.:N", title="Vehicle No."),
                 alt.Tooltip(f"{y_col}:Q", title=y_title, format=",.2f"),
@@ -950,37 +958,17 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
                         point_tooltip_items.append(alt.Tooltip(f"{idle_col_name}:Q", title=idle_title_tooltip, format=",.2f"))
 
             try:
-                # Base chart definition
                 base = alt.Chart(subset_df_scatter).encode(
                     x=x_axis, 
                     y=alt.Y(f"{y_col}:Q", title=y_title, scale=alt.Scale(zero=False)) 
                 )
-
-                # Scatter plot points
                 points = base.mark_circle(size=60, opacity=0.7).encode(
                     tooltip=point_tooltip_items,
                     color=alt.Color("Vehicle no.:N", legend=None) 
                 ).interactive() 
-
-                # Regression line (still drawn by Altair for visualization)
-                x_field_name_for_regression = "Time of Day Numeric" 
-                
-                # We don't need params=True or the line tooltip for stats anymore if displaying above
-                line = base.transform_regression(
-                    on=x_field_name_for_regression, 
-                    regression=y_col,
-                    method="linear" 
-                ).mark_line(color="red")          
-
-                # Combine scatter plot and regression line
-                # The title in .properties() is for the chart itself, distinct from the st.write title for the section
-                chart = (points + line).properties(
-                    height=400,
-                    title=f"Chart: {y_title} vs. Origin Departure Time" 
-                )
-                
+                line = base.transform_regression(on="Time of Day Numeric", regression=y_col).mark_line(color="red")          
+                chart = (points + line).properties(height=400, title=f"Chart: {y_title} vs. Origin Departure Time")
                 st.altair_chart(chart, use_container_width=True)
-
             except Exception as e:
                  st.error(f"Error generating scatter plot for {y_title}: {e}")
         else:
@@ -991,4 +979,7 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
 
 
 if __name__ == "__main__":
+    # Remove the original functions that are now replaced to avoid clutter
+    # if 'analyze_stop_crossings' in globals(): del globals()['analyze_stop_crossings']
+    # if '_process_single_bus' in globals(): del globals()['_process_single_bus']
     main()
