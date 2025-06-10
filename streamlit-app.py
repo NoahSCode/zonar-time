@@ -910,29 +910,22 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
             # Section title
             st.write(f"#### {y_title} vs. Time of Day")
 
-            # --- Calculate and Display Regression Statistics using SciPy ---
-            x_values = subset_df_scatter["Time of Day Numeric"].values
-            y_values = subset_df_scatter[y_col].values
+            # --- Calculate Rolling Mean Statistics ---
+            # Sort by time of day for proper rolling calculation
+            subset_df_scatter = subset_df_scatter.sort_values("Time of Day Numeric")
+            
+            # Calculate rolling mean with a window size (adjust as needed)
+            window_size = max(5, len(subset_df_scatter) // 10)  # Dynamic window size, minimum 5
+            subset_df_scatter['rolling_mean'] = subset_df_scatter[y_col].rolling(
+                window=window_size, center=True, min_periods=1
+            ).mean()
 
-            if len(x_values) >= 2 and len(y_values) >= 2: # Need at least 2 points for linregress
-                try:
-                    # Perform linear regression
-                    slope, intercept, r_value, p_value, std_err = linregress(x_values, y_values)
-                    r_squared = r_value**2
-
-                    # Display statistics using st.metric in columns
-                    st.markdown("**Regression Statistics:**")
-                    stat_col1, stat_col2, stat_col3 = st.columns(3)
-                    stat_col1.metric(label="Slope", value=f"{slope:.4f}")
-                    stat_col2.metric(label="Intercept", value=f"{intercept:.4f}")
-                    stat_col3.metric(label="R-squared (R²)", value=f"{r_squared:.4f}")
-                
-                except ValueError as ve: # Handle cases where linregress might fail (e.g., all x_values are the same)
-                    st.warning(f"Could not calculate regression statistics for {y_title}: {ve}. Not enough distinct data points.")
-                except Exception as e: # Catch any other unexpected errors during regression
-                    st.error(f"An error occurred during regression calculation for {y_title}: {e}")
-            else:
-                st.write(f"Not enough data points (found {len(x_values)}, need at least 2) to calculate regression statistics for {y_title}.")
+            # Display rolling mean statistics
+            st.markdown("**Rolling Mean Statistics:**")
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+            stat_col1.metric(label="Window Size", value=f"{window_size}")
+            stat_col2.metric(label="Mean Value", value=f"{subset_df_scatter[y_col].mean():.4f}")
+            stat_col3.metric(label="Std Deviation", value=f"{subset_df_scatter[y_col].std():.4f}")
             # --- End of Statistics Calculation and Display ---
 
             # Tooltip for individual scatter points (remains the same)
@@ -949,6 +942,11 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
                     if pd.api.types.is_numeric_dtype(subset_df_scatter[idle_col_name]):
                         point_tooltip_items.append(alt.Tooltip(f"{idle_col_name}:Q", title=idle_title_tooltip, format=",.2f"))
 
+            # Add rolling mean to tooltip
+            rolling_tooltip_items = point_tooltip_items + [
+                alt.Tooltip("rolling_mean:Q", title="Rolling Mean", format=",.2f")
+            ]
+
             try:
                 # Base chart definition
                 base = alt.Chart(subset_df_scatter).encode(
@@ -962,21 +960,21 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
                     color=alt.Color("Vehicle no.:N", legend=None) 
                 ).interactive() 
 
-                # Regression line (still drawn by Altair for visualization)
-                x_field_name_for_regression = "Time of Day Numeric" 
-                
-                # We don't need params=True or the line tooltip for stats anymore if displaying above
-                line = base.transform_regression(
-                    on=x_field_name_for_regression, 
-                    regression=y_col,
-                    method="linear" 
-                ).mark_line(color="red")          
+                # Rolling mean line (replaces regression line)
+                rolling_line = alt.Chart(subset_df_scatter).mark_line(
+                    color="red", 
+                    strokeWidth=3,
+                    opacity=0.8
+                ).encode(
+                    x=x_axis,
+                    y=alt.Y("rolling_mean:Q", title=y_title),
+                    tooltip=rolling_tooltip_items
+                )
 
-                # Combine scatter plot and regression line
-                # The title in .properties() is for the chart itself, distinct from the st.write title for the section
-                chart = (points + line).properties(
+                # Combine scatter plot and rolling mean line
+                chart = (points + rolling_line).properties(
                     height=400,
-                    title=f"Chart: {y_title} vs. Origin Departure Time" 
+                    title=f"Chart: {y_title} vs. Origin Departure Time (with Rolling Mean)" 
                 )
                 
                 st.altair_chart(chart, use_container_width=True)
@@ -987,7 +985,6 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
             st.write(f"Not enough valid data for '{y_title} vs. Time of Day' scatter plot (after dropping NaNs).")
     else:
         missing = [col for col in required_cols if col not in df.columns]
-        st.write(f"Required column(s) missing for scatter plot '{y_title}': {', '.join(missing)}")
 
 
 if __name__ == "__main__":
