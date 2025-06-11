@@ -642,8 +642,17 @@ def main():
         gap_dist_filter = st.sidebar.number_input("Distance Cluster Gap (miles)", min_value=0.01, value=0.3, format="%.2f", step=0.05)
         dwell_gap_filter = st.sidebar.number_input("Dwell Time Cluster Gap (mins)", min_value=0.01, value=0.3, format="%.2f", step=0.05)
         iqr_mult_filter = st.sidebar.number_input("IQR Dwell Multiplier", min_value=0.1, value=1.5, format="%.1f", step=0.1)
-        min_dwell_filter = st.sidebar.number_input("Min Dwell Time (seconds)", min_value=0.0, value=0.0, format="%.1f", step=1.0)
-        max_dwell_filter = st.sidebar.number_input("Max Dwell Time (seconds, 0=no max)", min_value=0.0, value=0.0, format="%.1f", step=1.0)
+        
+        st.sidebar.markdown("Origin Dwell Time (seconds)")
+        o_col1, o_col2 = st.sidebar.columns(2)
+        origin_min_dwell = o_col1.number_input("Min", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="origin_min_dwell")
+        origin_max_dwell = o_col2.number_input("Max (0=inf)", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="origin_max_dwell")
+
+        st.sidebar.markdown("Destination Dwell Time (seconds)")
+        d_col1, d_col2 = st.sidebar.columns(2)
+        dest_min_dwell = d_col1.number_input("Min", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="dest_min_dwell")
+        dest_max_dwell = d_col2.number_input("Max (0=inf)", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="dest_max_dwell")
+
         rm_tt_15_filter = st.sidebar.checkbox("Remove Top 15% Travel Time Outliers?", value=False)
 
         if st.button("🚀 Analyze Stop Crossings", type="primary", use_container_width=True):
@@ -689,19 +698,29 @@ def main():
                 st.write(f"After destination dwell IQR filter: {len(final_df)}")
                 if _check_empty_and_stop(final_df, "destination dwell IQR"): return
 
-                if min_dwell_filter > 0:
-                    min_dwell_filter_mins = min_dwell_filter / 60.0
-                    final_df = final_df[final_df["Origin Stop Idle (mins)"] >= min_dwell_filter_mins]
-                    final_df = final_df[final_df["Destination Stop Idle (mins)"] >= min_dwell_filter_mins]
-                    st.write(f"After min dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "min dwell time"): return
+                if origin_min_dwell > 0:
+                    origin_min_dwell_mins = origin_min_dwell / 60.0
+                    final_df = final_df[final_df["Origin Stop Idle (mins)"] >= origin_min_dwell_mins]
+                    st.write(f"After origin min dwell time filter: {len(final_df)}")
+                    if _check_empty_and_stop(final_df, "origin min dwell time"): return
                 
-                if max_dwell_filter > 0:
-                    max_dwell_filter_mins = max_dwell_filter / 60.0
-                    final_df = final_df[final_df["Origin Stop Idle (mins)"] <= max_dwell_filter_mins]
-                    final_df = final_df[final_df["Destination Stop Idle (mins)"] <= max_dwell_filter_mins]
-                    st.write(f"After max dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "max dwell time"): return
+                if origin_max_dwell > 0:
+                    origin_max_dwell_mins = origin_max_dwell / 60.0
+                    final_df = final_df[final_df["Origin Stop Idle (mins)"] <= origin_max_dwell_mins]
+                    st.write(f"After origin max dwell time filter: {len(final_df)}")
+                    if _check_empty_and_stop(final_df, "origin max dwell time"): return
+
+                if dest_min_dwell > 0:
+                    dest_min_dwell_mins = dest_min_dwell / 60.0
+                    final_df = final_df[final_df["Destination Stop Idle (mins)"] >= dest_min_dwell_mins]
+                    st.write(f"After destination min dwell time filter: {len(final_df)}")
+                    if _check_empty_and_stop(final_df, "destination min dwell time"): return
+
+                if dest_max_dwell > 0:
+                    dest_max_dwell_mins = dest_max_dwell / 60.0
+                    final_df = final_df[final_df["Destination Stop Idle (mins)"] <= dest_max_dwell_mins]
+                    st.write(f"After destination max dwell time filter: {len(final_df)}")
+                    if _check_empty_and_stop(final_df, "destination max dwell time"): return
 
                 if rm_tt_15_filter and not final_df.empty and "Travel Time" in final_df.columns and final_df["Travel Time"].dropna().shape[0] > 0:
                     final_df = final_df[final_df["Travel Time"] <= final_df["Travel Time"].quantile(0.85)]
