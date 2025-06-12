@@ -68,12 +68,16 @@ def _process_single_bus(
     in_origin_zone_vals = bus_df['in_origin_zone'].values
     in_dest_zone_vals = bus_df['in_dest_zone'].values
     distance_traveled_vals = bus_df["Distance Traveled(Miles)"].values
+    has_route_col = 'Route' in bus_df.columns
+    route_vals = bus_df['Route'].values if has_route_col else None
+
 
     results_for_bus = []
     inside_origin, inside_dest = False, False
     origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
-    last_ping_in_origin_dt_current_trip = pd.NaT # ADDED: To store the last ping time inside origin for the current trip
+    last_ping_in_origin_dt_current_trip = pd.NaT
     origin_depart_ping_idx = -1
+    route_for_current_trip = None # ADDED: Route state for the trip
 
     for i in range(len(bus_df) - 1):
         curr_datetime = pd.Timestamp(datetime_vals[i])
@@ -91,8 +95,10 @@ def _process_single_bus(
         if inside_origin and c_in_ori and not n_in_ori:
             inside_origin = False
             origin_depart_time = interpolate_time(curr_datetime, nxt_datetime)
-            last_ping_in_origin_dt_current_trip = curr_datetime # MODIFIED: Store this specific ping time
+            last_ping_in_origin_dt_current_trip = curr_datetime
             origin_depart_ping_idx = i + 1
+            if has_route_col:
+                route_for_current_trip = route_vals[i] # ADDED: Capture route from last ping in origin
 
         if not pd.isna(origin_depart_time) and not inside_dest and c_in_dst:
             if curr_datetime < origin_depart_time:
@@ -112,6 +118,7 @@ def _process_single_bus(
                 origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
                 last_ping_in_origin_dt_current_trip = pd.NaT
                 origin_depart_ping_idx = -1
+                route_for_current_trip = None # ADDED: Reset route
                 continue # Continue to the next ping
             
             inside_dest = True
@@ -143,19 +150,23 @@ def _process_single_bus(
                     travel_date_to_format = event_dt.date()
             travel_date_str = travel_date_to_format.strftime("%m/%d/%Y") if travel_date_to_format else None
 
-            results_for_bus.append({
+            result_dict = { # MODIFIED: Create dict to conditionally add Route
                 "Vehicle no.": bus_id, "Travel Date": travel_date_str,
                 "Origin Stop": origin_stop_name, "Destination Stop": dest_stop_name,
                 "Origin Stop Arrival": origin_arrival_time,
                 "Origin Stop Departure": origin_depart_time,
-                "Last Ping In Origin DateTime": last_ping_in_origin_dt_current_trip, # ADDED: Include in results
+                "Last Ping In Origin DateTime": last_ping_in_origin_dt_current_trip,
                 "Origin Stop Idle (mins)": round(origin_idle_mins, 2),
                 "Destination Stop Entry": dest_arrival_time,
                 "Destination Stop Departure": pd.NaT,
                 "Destination Stop Idle (mins)": None,
                 "Actual Distance (miles)": round(actual_distance, 3),
                 "Travel Time": round(travel_time_mins, 2)
-            })
+            }
+            if has_route_col: # ADDED: Conditionally add Route
+                result_dict["Route"] = route_for_current_trip
+            
+            results_for_bus.append(result_dict)
 
         if inside_dest and c_in_dst and not n_in_dst:
             inside_dest = False
@@ -173,8 +184,9 @@ def _process_single_bus(
                     last_record["Destination Stop Idle (mins)"] = round(dest_idle_mins, 2)
 
             origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
-            last_ping_in_origin_dt_current_trip = pd.NaT # MODIFIED: Reset for next trip
+            last_ping_in_origin_dt_current_trip = pd.NaT
             origin_depart_ping_idx = -1
+            route_for_current_trip = None # ADDED: Reset route
     return results_for_bus
 
 def analyze_stop_crossings(
@@ -212,7 +224,7 @@ def analyze_stop_crossings(
     df = pd.DataFrame(all_results_list)
 
     datetime_cols = [
-        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
         "Destination Stop Entry", "Destination Stop Departure"
     ]
     for col in datetime_cols:
@@ -220,8 +232,8 @@ def analyze_stop_crossings(
             df[col] = pd.to_datetime(df[col], errors='coerce')
     
     final_cols_ordered = [
-        "Vehicle no.", "Travel Date", "Origin Stop", "Destination Stop",
-        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+        "Vehicle no.", "Travel Date", "Route", "Origin Stop", "Destination Stop", # ADDED Route
+        "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
         "Origin Stop Idle (mins)",
         "Destination Stop Entry", "Destination Stop Departure", "Destination Stop Idle (mins)",
         "Actual Distance (miles)", "Travel Time"
@@ -507,7 +519,7 @@ def main():
     google_maps_api_key = st.sidebar.text_input("Google Maps API Key (Optional)", value="", type="password")
 
     default_session_state = {
-        "filtered_df": pd.DataFrame(), "stops_df": pd.DataFrame(), "path_df": pd.DataFrame(),
+        "processed_results": pd.DataFrame(), "stops_df": pd.DataFrame(), "path_df": pd.DataFrame(),
         "origin_stop_name_id": None, "destination_stop_name_id": None, 
         "r_feet_origin": 200, "r_feet_dest": 200,
         "start_date_filter": None, "end_date_filter": None
@@ -518,7 +530,7 @@ def main():
 
     c1_file, c2_file = st.columns(2)
     stops_file = c1_file.file_uploader("Upload Stops Classification CSV (Stop Name, Lat, Lon, Stop ID)", type=["csv"])
-    path_file = c2_file.file_uploader("Upload Zonar Data CSV (Asset No., Date, Time, Dist, Lat, Lon)", type=["csv"])
+    path_file = c2_file.file_uploader("Upload Zonar Data CSV (Asset No., Date, Time, Dist, Lat, Lon, Route)", type=["csv"])
 
     if stops_file and st.session_state.stops_df.empty: 
         try:
@@ -540,10 +552,10 @@ def main():
             st.error(f"Error loading stops CSV: {e}")
             st.session_state["stops_df"] = pd.DataFrame() 
 
-    if path_file and st.session_state.path_df.empty: 
+    if path_file and st.session_state.get("raw_path_df", pd.DataFrame()).empty:
         try:
-            path_req_cols = ["Asset No.", "Date", "Time(EST)", "Time(EDT)", "Distance Traveled(Miles)", "Lat", "Lon"]
-            path_df_loaded = pd.read_csv(path_file, usecols=lambda c: c in path_req_cols + ["Time(EST)", "Time(EDT)"]) 
+            all_possible_cols = ["Asset No.", "Date", "Time(EST)", "Time(EDT)", "Distance Traveled(Miles)", "Lat", "Lon", "Route"]
+            path_df_loaded = pd.read_csv(path_file, usecols=lambda c: c in all_possible_cols)
 
             essential_path_cols = ["Asset No.", "Date", "Distance Traveled(Miles)", "Lat", "Lon"]
             if not set(essential_path_cols).issubset(path_df_loaded.columns):
@@ -564,14 +576,17 @@ def main():
             if path_df_loaded.empty:
                 st.warning("No valid DateTime entries found in Path data after parsing.")
             else:
+                cols_to_keep = ["Asset No.", "DateTime", "Distance Traveled(Miles)", "Lat", "Lon"]
+                if "Route" in path_df_loaded.columns:
+                    path_df_loaded["Route"] = path_df_loaded["Route"].astype(str).fillna("Unassigned")
+                    cols_to_keep.append("Route")
+                
                 path_df_loaded["Asset No."] = path_df_loaded["Asset No."].astype("category")
                 path_df_loaded["Lat"] = path_df_loaded["Lat"].astype("float64")
                 path_df_loaded["Lon"] = path_df_loaded["Lon"].astype("float64")
                 path_df_loaded["Distance Traveled(Miles)"] = path_df_loaded["Distance Traveled(Miles)"].astype("float32")
                 
-                st.session_state["raw_path_df"] = path_df_loaded.sort_values(["Asset No.", "DateTime"]).reset_index(drop=True)[
-                    ["Asset No.", "DateTime", "Distance Traveled(Miles)", "Lat", "Lon"]
-                ]
+                st.session_state["raw_path_df"] = path_df_loaded.sort_values(["Asset No.", "DateTime"]).reset_index(drop=True)[cols_to_keep]
                 st.success(f"Loaded {len(st.session_state['raw_path_df'])} path records.")
         except Exception as e:
             st.error(f"Error loading path CSV: {e}")
@@ -682,8 +697,8 @@ def main():
                 
                 if res_df.empty:
                     st.warning("No initial trips found between the selected stops with the given radii.")
-                    st.session_state["filtered_df"] = pd.DataFrame()
-                    return 
+                    st.session_state["processed_results"] = pd.DataFrame()
+                    st.stop() 
 
                 final_df = res_df.copy()
                 st.write(f"Initial trips found: {len(final_df)}")
@@ -733,7 +748,7 @@ def main():
                 )
                 final_df["Time of Day Label"] = final_df["Time of Day Numeric"].apply(format_time_of_day_label)
                 
-                st.session_state["filtered_df"] = final_df.reset_index(drop=True)
+                st.session_state["processed_results"] = final_df.reset_index(drop=True)
     
     elif (stops_file or not st.session_state.stops_df.empty) and \
          (path_file or not st.session_state.get("raw_path_df", pd.DataFrame()).empty) and \
@@ -743,7 +758,34 @@ def main():
         st.info("Please upload Stops and Zonar Path data CSV files to begin analysis.")
 
 
-    display_df_final = st.session_state.get("filtered_df", pd.DataFrame())
+    # --- NEW: ROUTE FILTER AND DISPLAY LOGIC ---
+    display_df_final = pd.DataFrame() # Initialize empty dataframe
+    processed_df = st.session_state.get("processed_results", pd.DataFrame())
+
+    if not processed_df.empty:
+        # Check if Route column exists to enable filtering
+        if 'Route' in processed_df.columns:
+            st.markdown("---")
+            st.header("Filter Results by Route")
+            all_routes = sorted(processed_df['Route'].dropna().unique().tolist())
+            
+            if len(all_routes) > 1:
+                selected_routes = st.multiselect(
+                    "Select routes to display",
+                    options=all_routes,
+                    default=all_routes
+                )
+                if not selected_routes:
+                    st.warning("Please select at least one route to view results.")
+                    display_df_final = pd.DataFrame()
+                else:
+                    display_df_final = processed_df[processed_df['Route'].isin(selected_routes)]
+            else: # Only one or zero routes found, no filter needed
+                st.info(f"All trips in the result set belong to one route. Showing all {len(processed_df)} trips.")
+                display_df_final = processed_df
+        else: # Fallback if no Route column
+            display_df_final = processed_df
+
     if not display_df_final.empty:
         st.header(f"📊 Analysis Results: {len(display_df_final)} Trips")
 
@@ -838,7 +880,8 @@ def main():
             map_df_selection["D_Arrival_DT_map"] = pd.to_datetime(map_df_selection["Destination Stop Entry"], errors='coerce')
 
             for idx, row in map_df_selection.head(100).iterrows():
-                label = f"Trip (Idx {row.name}) | Bus: {row['Vehicle no.']} | Travel Time: {row['Travel Time']:.1f}m"
+                route_info = f"Route: {row['Route']} | " if 'Route' in row else ""
+                label = f"Trip (Idx {row.name}) | {route_info}Bus: {row['Vehicle no.']} | Travel Time: {row['Travel Time']:.1f}m"
                 map_options_list.append((label, row.name)) 
 
             if map_options_list:
@@ -899,7 +942,7 @@ def _check_empty_and_stop(df: pd.DataFrame, filter_name: str) -> bool:
     """Checks if DataFrame is empty after a filter, warns, clears session state, and stops if so."""
     if df.empty:
         st.warning(f"All trips removed by {filter_name} filter.")
-        st.session_state["filtered_df"] = pd.DataFrame() 
+        st.session_state["processed_results"] = pd.DataFrame() 
         st.stop() 
         return True
     return False
