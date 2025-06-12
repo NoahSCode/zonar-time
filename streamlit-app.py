@@ -97,6 +97,22 @@ def _process_single_bus(
         if not pd.isna(origin_depart_time) and not inside_dest and c_in_dst:
             if curr_datetime < origin_depart_time:
                 continue
+
+            # Check if origin departure and destination arrival are on the same operational day
+            origin_op_date = origin_depart_time.date()
+            if origin_depart_time.hour < op_day_cutoff_hour:
+                origin_op_date -= timedelta(days=1)
+
+            dest_op_date = curr_datetime.date()
+            if curr_datetime.hour < op_day_cutoff_hour:
+                dest_op_date -= timedelta(days=1)
+
+            if origin_op_date != dest_op_date:
+                # Trip spans operational days, invalidate this origin event and reset state
+                origin_arrival_time, origin_depart_time, dest_arrival_time = pd.NaT, pd.NaT, pd.NaT
+                last_ping_in_origin_dt_current_trip = pd.NaT
+                origin_depart_ping_idx = -1
+                continue # Continue to the next ping
             
             inside_dest = True
             dest_arrival_time = curr_datetime
@@ -643,15 +659,12 @@ def main():
         dwell_gap_filter = st.sidebar.number_input("Dwell Time Cluster Gap (mins)", min_value=0.01, value=0.3, format="%.2f", step=0.05)
         iqr_mult_filter = st.sidebar.number_input("IQR Dwell Multiplier", min_value=0.1, value=1.5, format="%.1f", step=0.1)
         
-        st.sidebar.markdown("Origin Dwell Time (seconds)")
-        o_col1, o_col2 = st.sidebar.columns(2)
-        origin_min_dwell = o_col1.number_input("Min", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="origin_min_dwell")
-        origin_max_dwell = o_col2.number_input("Max (0=inf)", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="origin_max_dwell")
-
-        st.sidebar.markdown("Destination Dwell Time (seconds)")
-        d_col1, d_col2 = st.sidebar.columns(2)
-        dest_min_dwell = d_col1.number_input("Min", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="dest_min_dwell")
-        dest_max_dwell = d_col2.number_input("Max (0=inf)", min_value=0.0, value=0.0, format="%.1f", step=1.0, key="dest_max_dwell")
+        combined_threshold_secs = st.sidebar.number_input(
+            "Min Travel + Dest Dwell Time (seconds)",
+            min_value=0.0, value=st.session_state.get("combined_threshold", 0.0), format="%.1f", step=1.0,
+            key="combined_threshold",
+            help="Excludes trips from destination dwell calculations where (Travel Time + Destination Dwell Time) is LESS than this value. Set to 0 to disable."
+        )
 
         rm_tt_15_filter = st.sidebar.checkbox("Remove Top 15% Travel Time Outliers?", value=False)
 
@@ -698,30 +711,6 @@ def main():
                 st.write(f"After destination dwell IQR filter: {len(final_df)}")
                 if _check_empty_and_stop(final_df, "destination dwell IQR"): return
 
-                if origin_min_dwell > 0:
-                    origin_min_dwell_mins = origin_min_dwell / 60.0
-                    final_df = final_df[final_df["Origin Stop Idle (mins)"] >= origin_min_dwell_mins]
-                    st.write(f"After origin min dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "origin min dwell time"): return
-                
-                if origin_max_dwell > 0:
-                    origin_max_dwell_mins = origin_max_dwell / 60.0
-                    final_df = final_df[final_df["Origin Stop Idle (mins)"] <= origin_max_dwell_mins]
-                    st.write(f"After origin max dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "origin max dwell time"): return
-
-                if dest_min_dwell > 0:
-                    dest_min_dwell_mins = dest_min_dwell / 60.0
-                    final_df = final_df[final_df["Destination Stop Idle (mins)"] >= dest_min_dwell_mins]
-                    st.write(f"After destination min dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "destination min dwell time"): return
-
-                if dest_max_dwell > 0:
-                    dest_max_dwell_mins = dest_max_dwell / 60.0
-                    final_df = final_df[final_df["Destination Stop Idle (mins)"] <= dest_max_dwell_mins]
-                    st.write(f"After destination max dwell time filter: {len(final_df)}")
-                    if _check_empty_and_stop(final_df, "destination max dwell time"): return
-
                 if rm_tt_15_filter and not final_df.empty and "Travel Time" in final_df.columns and final_df["Travel Time"].dropna().shape[0] > 0:
                     final_df = final_df[final_df["Travel Time"] <= final_df["Travel Time"].quantile(0.85)]
                 st.write(f"After travel time percentile filter: {len(final_df)}")
@@ -757,20 +746,33 @@ def main():
     display_df_final = st.session_state.get("filtered_df", pd.DataFrame())
     if not display_df_final.empty:
         st.header(f"📊 Analysis Results: {len(display_df_final)} Trips")
-        
+
+        # --- Conditionally Filter for Destination Dwell Calculations ---
+        combined_threshold_secs_val = st.session_state.get("combined_threshold", 0.0)
+        dest_dwell_display_df = display_df_final.copy()
+
+        if combined_threshold_secs_val > 0:
+            combined_threshold_mins = combined_threshold_secs_val / 60.0
+            if "Travel Time" in dest_dwell_display_df.columns and "Destination Stop Idle (mins)" in dest_dwell_display_df.columns:
+                dest_dwell_display_df = dest_dwell_display_df[
+                    (dest_dwell_display_df["Travel Time"].fillna(0) + dest_dwell_display_df["Destination Stop Idle (mins)"].fillna(0)) >= combined_threshold_mins
+                ]
+                st.info(f"{len(dest_dwell_display_df)} trips are included in destination dwell calculations (based on the combined threshold).")
+        # --- End of Conditional Filtering ---
+
         disp_copy = display_df_final.copy()
         dt_display_cols = [
-            "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime", # ADDED
+            "Origin Stop Arrival", "Origin Stop Departure", "Last Ping In Origin DateTime",
             "Destination Stop Entry", "Destination Stop Departure"
         ]
         for c in dt_display_cols:
             if c in disp_copy.columns:
                 if pd.api.types.is_datetime64_any_dtype(disp_copy[c]):
                     disp_copy[c] = disp_copy[c].dt.strftime("%m/%d/%Y %I:%M:%S %p").fillna("N/A")
-                else: 
+                else:
                     disp_copy[c] = pd.to_datetime(disp_copy[c], errors='coerce').dt.strftime("%m/%d/%Y %I:%M:%S %p").fillna("N/A")
         
-        cols_to_drop_for_display = ["O_Depart_DT", "Travel Date_dt", "Time of Day Numeric"] 
+        cols_to_drop_for_display = ["O_Depart_DT", "Travel Date_dt", "Time of Day Numeric"]
         st.dataframe(disp_copy.drop(columns=cols_to_drop_for_display, errors='ignore'), use_container_width=True)
     
         st.subheader("Summary Metrics")
@@ -781,7 +783,7 @@ def main():
                 len(display_df_final),
                 display_df_final["Vehicle no."].nunique(),
                 _safe_round(display_df_final["Origin Stop Idle (mins)"].mean()),
-                _safe_round(display_df_final["Destination Stop Idle (mins)"].mean()),
+                _safe_round(dest_dwell_display_df["Destination Stop Idle (mins)"].mean()), # Use filtered DF
                 _safe_round(display_df_final["Actual Distance (miles)"].mean(), 3),
                 _safe_round(display_df_final["Travel Time"].mean())
             ]
@@ -789,37 +791,56 @@ def main():
         st.dataframe(pd.DataFrame(metrics_data), use_container_width=True)
 
         st.subheader("Distribution Plots")
+        # Base DF for plots that are not conditionally filtered
         plot_df_secs = display_df_final.copy()
         for col_min, col_sec in [
             ("Travel Time", "Travel Time (secs)"),
             ("Origin Stop Idle (mins)", "Origin Stop Idle (secs)"),
-            ("Destination Stop Idle (mins)", "Destination Stop Idle (secs)")
         ]:
             if col_min in plot_df_secs.columns:
-                plot_df_secs[col_sec] = plot_df_secs[col_min].astype(float) * 60 
+                plot_df_secs[col_sec] = plot_df_secs[col_min].astype(float) * 60
+
+        # DF for the conditionally filtered destination dwell plot
+        dest_plot_df_secs = dest_dwell_display_df.copy()
+        if "Destination Stop Idle (mins)" in dest_plot_df_secs.columns:
+            dest_plot_df_secs["Destination Stop Idle (secs)"] = dest_plot_df_secs["Destination Stop Idle (mins)"].astype(float) * 60
 
         _plot_dist(plot_df_secs, "Travel Time (secs)", "Travel Time (seconds)", "Travel Time")
         _plot_dist(plot_df_secs, "Origin Stop Idle (secs)", "Origin Dwell Time (seconds)", "Origin Dwell")
-        _plot_dist(plot_df_secs, "Destination Stop Idle (secs)", "Destination Dwell Time (seconds)", "Destination Dwell")
+        _plot_dist(dest_plot_df_secs, "Destination Stop Idle (secs)", "Destination Dwell Time (seconds)", "Destination Dwell") # Use filtered DF
 
         st.subheader("Time of Day Scatter Plots")
         scatter_df_tod = display_df_final.dropna(subset=["Time of Day Numeric", "O_Depart_DT"]).copy()
         
         if not scatter_df_tod.empty:
-            min_tod_plot = scatter_df_tod["Time of Day Numeric"].min() -1 
+            # Prepare data in seconds for scatter plots
+            scatter_df_tod_secs = scatter_df_tod.copy()
+            dest_dwell_display_df_secs = dest_dwell_display_df.copy()
+
+            for col_min, col_sec in [
+                ("Travel Time", "Travel Time (secs)"),
+                ("Origin Stop Idle (mins)", "Origin Stop Idle (secs)")
+            ]:
+                if col_min in scatter_df_tod_secs.columns:
+                    scatter_df_tod_secs[col_sec] = scatter_df_tod_secs[col_min].astype(float) * 60
+            
+            if "Destination Stop Idle (mins)" in dest_dwell_display_df_secs.columns:
+                dest_dwell_display_df_secs["Destination Stop Idle (secs)"] = dest_dwell_display_df_secs["Destination Stop Idle (mins)"].astype(float) * 60
+
+            min_tod_plot = scatter_df_tod["Time of Day Numeric"].min() -1
             max_tod_plot = scatter_df_tod["Time of Day Numeric"].max() + 1
-            min_tod_plot = max(0, min_tod_plot) 
+            min_tod_plot = max(0, min_tod_plot)
             
             if max_tod_plot - min_tod_plot < 24:
                 max_tod_plot = min_tod_plot + 24
             
             x_axis_tod = alt.X("Time of Day Numeric:Q", title="Time of Day (Origin Departure)",
                                scale=alt.Scale(domain=[min_tod_plot, max_tod_plot], clamp=True),
-                               axis=alt.Axis(labelAngle=-45, tickCount=12)) 
+                               axis=alt.Axis(labelAngle=-45, tickCount=12))
 
-            _plot_scatter_tod(scatter_df_tod, "Travel Time", "Travel Time (mins)", x_axis_tod)
-            _plot_scatter_tod(scatter_df_tod, "Origin Stop Idle (mins)", "Origin Dwell (mins)", x_axis_tod)
-            _plot_scatter_tod(scatter_df_tod, "Destination Stop Idle (mins)", "Dest. Dwell (mins)", x_axis_tod)
+            _plot_scatter_tod(scatter_df_tod_secs, "Travel Time (secs)", "Travel Time (secs)", x_axis_tod)
+            _plot_scatter_tod(scatter_df_tod_secs, "Origin Stop Idle (secs)", "Origin Dwell (secs)", x_axis_tod)
+            _plot_scatter_tod(dest_dwell_display_df_secs, "Destination Stop Idle (secs)", "Dest. Dwell (secs)", x_axis_tod)
         else:
             st.write("Not enough data for Time of Day scatter plots (after removing entries with missing time data).")
 
