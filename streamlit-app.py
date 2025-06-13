@@ -1,51 +1,108 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date, time # Added 'time'
+from datetime import datetime, timedelta, date, time
 import altair as alt
 import requests
 import streamlit.components.v1 as components
 from scipy.stats import linregress
-# math imports (radians, sin, cos, sqrt, atan2) are not explicitly needed at the top level
-# as np provides vectorized versions.
 
 ################################################################################
-# 1) Utility: Haversine & Circle checks (Optimized for vectorized use)
+# 1) Caching and Data Loading Functions
 ################################################################################
-EARTH_RADIUS_FEET = 20902231  # Earth's approximate radius in feet
+
+# @st.cache_data is the modern decorator for caching data like DataFrames.
+# It ensures that the expensive operation of reading and processing the file
+# happens only once. If the same file is uploaded again, Streamlit will
+
+# return the cached DataFrame instantly, preventing memory crashes.
+@st.cache_data
+def load_stops_data(uploaded_file):
+    """Loads and processes the stops classification CSV file."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    try:
+        stops_dtypes = {"Stop Name": "str", "Lat": "float64", "Lon": "float64", "Stop ID": "str"}
+        df = pd.read_csv(uploaded_file, dtype=stops_dtypes, usecols=list(stops_dtypes.keys()))
+        
+        required_stop_cols = ["Stop Name", "Lat", "Lon", "Stop ID"]
+        if not set(required_stop_cols).issubset(df.columns):
+            st.error(f"Stops CSV must have columns: {', '.join(required_stop_cols)}")
+            return pd.DataFrame()
+
+        df['_sort_stop_id_'] = pd.to_numeric(df['Stop ID'], errors='coerce')
+        df.sort_values(by=['_sort_stop_id_', 'Stop Name'], inplace=True, na_position='last')
+        df.drop(columns=['_sort_stop_id_'], inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df["Stop_Name_ID"] = df["Stop Name"] + " (" + df["Stop ID"].astype(str) + ")"
+        return df
+    except Exception as e:
+        st.error(f"Error loading stops CSV: {e}")
+        return pd.DataFrame()
+
+@st.cache_data
+def load_path_data(uploaded_file):
+    """Loads and processes the large Zonar path data CSV file."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    try:
+        all_possible_cols = ["Asset No.", "Date", "Time(EST)", "Time(EDT)", "Distance Traveled(Miles)", "Lat", "Lon", "Route"]
+        df = pd.read_csv(uploaded_file, usecols=lambda c: c in all_possible_cols)
+
+        essential_path_cols = ["Asset No.", "Date", "Distance Traveled(Miles)", "Lat", "Lon"]
+        if not set(essential_path_cols).issubset(df.columns):
+            st.error(f"Path CSV missing one or more mandatory columns: {', '.join(essential_path_cols)}")
+            return pd.DataFrame()
+
+        time_col_to_use = "Time(EDT)" if "Time(EDT)" in df.columns and df["Time(EDT)"].notna().any() else "Time(EST)"
+        if time_col_to_use not in df.columns:
+             st.error("Path CSV must contain 'Time(EST)' or 'Time(EDT)' column.")
+             return pd.DataFrame()
+
+        df["DateTime"] = pd.to_datetime(df["Date"] + " " + df[time_col_to_use], errors="coerce")
+        df.dropna(subset=["DateTime"], inplace=True)
+
+        if df.empty:
+            st.warning("No valid DateTime entries found in Path data after parsing.")
+            return pd.DataFrame()
+
+        cols_to_keep = ["Asset No.", "DateTime", "Distance Traveled(Miles)", "Lat", "Lon"]
+        if "Route" in df.columns:
+            df["Route"] = df["Route"].astype(str).fillna("Unassigned")
+            cols_to_keep.append("Route")
+        
+        df["Asset No."] = df["Asset No."].astype("category")
+        df["Lat"] = df["Lat"].astype("float64")
+        df["Lon"] = df["Lon"].astype("float64")
+        df["Distance Traveled(Miles)"] = df["Distance Traveled(Miles)"].astype("float32")
+        
+        return df.sort_values(["Asset No.", "DateTime"]).reset_index(drop=True)[cols_to_keep]
+    except Exception as e:
+        st.error(f"Error loading path CSV: {e}")
+        return pd.DataFrame()
+
+################################################################################
+# 2) Utility: Haversine & Circle checks (Sections Renumbered)
+################################################################################
+EARTH_RADIUS_FEET = 20902231
 
 def haversine_distance_vectorized(lat1_arr: np.ndarray, lon1_arr: np.ndarray, lat2_scalar: float, lon2_scalar: float) -> np.ndarray:
-    """
-    Calculate Haversine distance between arrays of points and a single point.
-    Optimized to use NumPy arrays directly.
-    """
-    lat1_rad = np.radians(lat1_arr)
-    lon1_rad = np.radians(lon1_arr)
-    lat2_rad = np.radians(lat2_scalar)
-    lon2_rad = np.radians(lon2_scalar)
-
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
+    lat1_rad, lon1_rad = np.radians(lat1_arr), np.radians(lon1_arr)
+    lat2_rad, lon2_rad = np.radians(lat2_scalar), np.radians(lon2_scalar)
+    dlat, dlon = lat2_rad - lat1_rad, lon2_rad - lon1_rad
     a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return EARTH_RADIUS_FEET * c
 
 def interpolate_time(t1: pd.Timestamp, t2: pd.Timestamp) -> pd.Timestamp | None:
-    """
-    Interpolate the midpoint time between two timestamps.
-    Returns None if either timestamp is NaT or None.
-    """
-    if pd.isna(t1) or pd.isna(t2): # Simplified check for NaT or None
-        return None
-    # Ensure t1 and t2 are timestamps if they are not already (e.g. datetime objects)
-    t1 = pd.Timestamp(t1)
-    t2 = pd.Timestamp(t2)
-    midpoint = t1 + (t2 - t1) / 2
-    return midpoint.replace(microsecond=0)
+    if pd.isna(t1) or pd.isna(t2): return None
+    t1, t2 = pd.Timestamp(t1), pd.Timestamp(t2)
+    return (t1 + (t2 - t1) / 2).replace(microsecond=0)
 
 ################################################################################
-# 2) Ping-Based Stop Crossing Analysis (Refactored)
+# 3) Ping-Based Stop Crossing Analysis (and the rest of your functions...)
 ################################################################################
+# ... (All your other functions: _process_single_bus, analyze_stop_crossings, filter_by_gap_clustering_largest, etc. remain here unchanged) ...
 def _process_single_bus(
     bus_df_original: pd.DataFrame, bus_id: str,
     origin_stop_name: str, origin_lat: float, origin_lon: float, radius_feet_origin: float,
@@ -239,10 +296,7 @@ def analyze_stop_crossings(
         "Actual Distance (miles)", "Travel Time"
     ]
     return df[[col for col in final_cols_ordered if col in df.columns]]
-
-################################################################################
-# 3) Distance Filter, 4) Idle Largest Cluster, 5) Idle IQR (Largely Unchanged)
-################################################################################
+#... [the rest of your functions here: filter_by_gap_clustering_largest, etc.]
 def filter_by_gap_clustering_largest(df: pd.DataFrame, gap_threshold: float = 0.3) -> pd.DataFrame:
     if df.empty or "Actual Distance (miles)" not in df.columns:
         return df.copy() 
@@ -506,6 +560,134 @@ def format_time_of_day_label(time_val_24hr: float) -> str:
         label += f" (+{day_offset} Days)"
     return label
 
+def _check_empty_and_stop(df: pd.DataFrame, filter_name: str) -> bool:
+    """Checks if DataFrame is empty after a filter, warns, clears session state, and stops if so."""
+    if df.empty:
+        st.warning(f"All trips removed by {filter_name} filter.")
+        st.session_state["processed_results"] = pd.DataFrame() 
+        st.stop() 
+        return True
+    return False
+
+def _safe_round(val, decimals=2):
+    if isinstance(val, (int, float, np.number)): 
+        if pd.notnull(val): 
+            return round(float(val), decimals)
+        else: 
+            return "N/A" 
+    elif pd.isna(val): 
+            return "N/A"
+    return "N/A" 
+
+
+def _plot_dist(df: pd.DataFrame, col_name: str, title_x: str, base_title: str):
+    if col_name in df.columns:
+        data_to_plot = df[[col_name]].dropna()
+        if not data_to_plot.empty:
+            st.write(f"#### Distribution of {base_title}")
+            try:
+                chart = alt.Chart(data_to_plot).mark_bar().encode(
+                    alt.X(f"{col_name}:Q", bin=alt.Bin(maxbins=30), title=title_x, type="quantitative"),
+                    alt.Y('count()', title="Number of Trips", type="quantitative")
+                ).properties(height=300, title=f"{base_title} Distribution")
+                st.altair_chart(chart, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error generating distribution plot for {base_title}: {e}")
+        else:
+            st.write(f"Not enough valid data for {base_title} distribution plot.")
+    else:
+        st.write(f"Column '{col_name}' not found for {base_title} distribution plot.")
+
+
+def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X):
+    required_cols = ["Time of Day Numeric", y_col, "O_Depart_DT", "Vehicle no.", "Time of Day Label"]
+    if all(col in df.columns for col in required_cols):
+        subset_df_scatter = df.copy()
+        if not pd.api.types.is_numeric_dtype(subset_df_scatter[y_col]):
+            subset_df_scatter[y_col] = pd.to_numeric(subset_df_scatter[y_col], errors='coerce')
+        
+        subset_df_scatter.dropna(subset=required_cols, inplace=True) 
+        
+        if not subset_df_scatter.empty:
+            # Section title
+            st.write(f"#### {y_title} vs. Time of Day")
+
+            # --- Calculate Rolling Mean Statistics ---
+            # Sort by time of day for proper rolling calculation
+            subset_df_scatter = subset_df_scatter.sort_values("Time of Day Numeric")
+            
+            # Calculate rolling mean with a window size (adjust as needed)
+            window_size = max(5, len(subset_df_scatter) // 10)  # Dynamic window size, minimum 5
+            subset_df_scatter['rolling_mean'] = subset_df_scatter[y_col].rolling(
+                window=window_size, center=True, min_periods=1
+            ).mean()
+
+            # Display rolling mean statistics
+            st.markdown("**Rolling Mean Statistics:**")
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+            stat_col1.metric(label="Window Size", value=f"{window_size}")
+            stat_col2.metric(label="Mean Value", value=f"{subset_df_scatter[y_col].mean():.4f}")
+            stat_col3.metric(label="Std Deviation", value=f"{subset_df_scatter[y_col].std():.4f}")
+            # --- End of Statistics Calculation and Display ---
+
+            # Tooltip for individual scatter points (remains the same)
+            point_tooltip_items = [
+                alt.Tooltip("Vehicle no.:N", title="Vehicle No."),
+                alt.Tooltip(f"{y_col}:Q", title=y_title, format=",.2f"),
+                alt.Tooltip("Time of Day Label:N", title="Time of Day (Adjusted)"),
+                alt.Tooltip("O_Depart_DT:T", title="Departure Timestamp", format='%m/%d/%Y %I:%M:%S %p')
+            ]
+            for idle_col_name, idle_title_tooltip in [
+                ("Origin Stop Idle (mins)", "Origin Idle (mins)"),
+                ("Destination Stop Idle (mins)", "Dest. Idle (mins)")]:
+                if idle_col_name in subset_df_scatter.columns and y_col != idle_col_name:
+                    if pd.api.types.is_numeric_dtype(subset_df_scatter[idle_col_name]):
+                        point_tooltip_items.append(alt.Tooltip(f"{idle_col_name}:Q", title=idle_title_tooltip, format=",.2f"))
+
+            # Add rolling mean to tooltip
+            rolling_tooltip_items = point_tooltip_items + [
+                alt.Tooltip("rolling_mean:Q", title="Rolling Mean", format=",.2f")
+            ]
+
+            try:
+                # Base chart definition
+                base = alt.Chart(subset_df_scatter).encode(
+                    x=x_axis, 
+                    y=alt.Y(f"{y_col}:Q", title=y_title, scale=alt.Scale(zero=False)) 
+                )
+
+                # Scatter plot points
+                points = base.mark_circle(size=60, opacity=0.7).encode(
+                    tooltip=point_tooltip_items,
+                    color=alt.Color("Vehicle no.:N", legend=None) 
+                ).interactive() 
+
+                # Rolling mean line (replaces regression line)
+                rolling_line = alt.Chart(subset_df_scatter).mark_line(
+                    color="red", 
+                    strokeWidth=3,
+                    opacity=0.8
+                ).encode(
+                    x=x_axis,
+                    y=alt.Y("rolling_mean:Q", title=y_title),
+                    tooltip=rolling_tooltip_items
+                )
+
+                # Combine scatter plot and rolling mean line
+                chart = (points + rolling_line).properties(
+                    height=400,
+                    title=f"Chart: {y_title} vs. Origin Departure Time (with Rolling Mean)" 
+                )
+                
+                st.altair_chart(chart, use_container_width=True)
+
+            except Exception as e:
+                 st.error(f"Error generating scatter plot for {y_title}: {e}")
+        else:
+            st.write(f"Not enough valid data for '{y_title} vs. Time of Day' scatter plot (after dropping NaNs).")
+    else:
+        missing = [col for col in required_cols if col not in df.columns]
+
 def main():
     st.set_page_config(layout="wide") 
     st.title("Zonar Stop Time Analysis")
@@ -518,8 +700,10 @@ def main():
     )
     google_maps_api_key = st.sidebar.text_input("Google Maps API Key (Optional)", value="", type="password")
 
+    # Initialize session state keys
     default_session_state = {
         "processed_results": pd.DataFrame(), "stops_df": pd.DataFrame(), "path_df": pd.DataFrame(),
+        "raw_path_df": pd.DataFrame(),
         "origin_stop_name_id": None, "destination_stop_name_id": None, 
         "r_feet_origin": 200, "r_feet_dest": 200,
         "start_date_filter": None, "end_date_filter": None
@@ -529,87 +713,45 @@ def main():
             st.session_state[key] = default_value
 
     c1_file, c2_file = st.columns(2)
-    stops_file = c1_file.file_uploader("Upload Stops Classification CSV (Stop Name, Lat, Lon, Stop ID)", type=["csv"])
-    path_file = c2_file.file_uploader("Upload Zonar Data CSV (Asset No., Date, Time, Dist, Lat, Lon, Route)", type=["csv"])
+    stops_file = c1_file.file_uploader("Upload Stops Classification CSV", type=["csv"])
+    path_file = c2_file.file_uploader("Upload Zonar Data CSV", type=["csv"])
 
-    if stops_file and st.session_state.stops_df.empty: 
-        try:
-            stops_dtypes = {"Stop Name": "str", "Lat": "float64", "Lon": "float64", "Stop ID": "str"}
-            stops_df_loaded = pd.read_csv(stops_file, dtype=stops_dtypes, usecols=list(stops_dtypes.keys()))
-            
-            required_stop_cols = ["Stop Name", "Lat", "Lon", "Stop ID"]
-            if not set(required_stop_cols).issubset(stops_df_loaded.columns):
-                st.error(f"Stops CSV must have columns: {', '.join(required_stop_cols)}")
-            else:
-                stops_df_loaded['_sort_stop_id_'] = pd.to_numeric(stops_df_loaded['Stop ID'], errors='coerce')
-                stops_df_loaded.sort_values(by=['_sort_stop_id_', 'Stop Name'], inplace=True, na_position='last')
-                stops_df_loaded.drop(columns=['_sort_stop_id_'], inplace=True)
-                stops_df_loaded.reset_index(drop=True, inplace=True)
-                stops_df_loaded["Stop_Name_ID"] = stops_df_loaded["Stop Name"] + " (" + stops_df_loaded["Stop ID"].astype(str) + ")"
-                st.session_state["stops_df"] = stops_df_loaded
-                st.success(f"Loaded {len(stops_df_loaded)} stops.")
-        except Exception as e:
-            st.error(f"Error loading stops CSV: {e}")
-            st.session_state["stops_df"] = pd.DataFrame() 
+    # --- REFACTORED DATA LOADING ---
+    # Call the cached functions to load data. This is efficient and safe.
+    stops_df_loaded = load_stops_data(stops_file)
+    if not stops_df_loaded.empty:
+        # Only update state if the loaded data is different
+        if not st.session_state.stops_df.equals(stops_df_loaded):
+             st.session_state.stops_df = stops_df_loaded
+             st.success(f"Loaded {len(stops_df_loaded)} stops.")
+             st.rerun()
 
-    if path_file and st.session_state.get("raw_path_df", pd.DataFrame()).empty:
-        try:
-            all_possible_cols = ["Asset No.", "Date", "Time(EST)", "Time(EDT)", "Distance Traveled(Miles)", "Lat", "Lon", "Route"]
-            path_df_loaded = pd.read_csv(path_file, usecols=lambda c: c in all_possible_cols)
+    path_df_loaded = load_path_data(path_file)
+    if not path_df_loaded.empty:
+        # Only update state and filters if the raw data has changed
+        if not st.session_state.raw_path_df.equals(path_df_loaded):
+            st.session_state.raw_path_df = path_df_loaded
+            # Reset downstream state since we have new data
+            st.session_state.path_df = pd.DataFrame()
+            st.session_state.start_date_filter = None
+            st.session_state.end_date_filter = None
+            st.success(f"Loaded and cached {len(st.session_state['raw_path_df'])} path records.")
+            st.rerun()
 
-            essential_path_cols = ["Asset No.", "Date", "Distance Traveled(Miles)", "Lat", "Lon"]
-            if not set(essential_path_cols).issubset(path_df_loaded.columns):
-                st.error(f"Path CSV missing one or more mandatory columns: {', '.join(essential_path_cols)}")
-                raise ValueError("Missing essential columns in path data.")
-
-            time_col_to_use = "Time(EDT)" if "Time(EDT)" in path_df_loaded.columns and path_df_loaded["Time(EDT)"].notna().any() else "Time(EST)"
-            if time_col_to_use not in path_df_loaded.columns:
-                 st.error("Path CSV must contain 'Time(EST)' or 'Time(EDT)' column.")
-                 raise ValueError("Missing time column in path data.")
-
-            path_df_loaded["DateTime"] = pd.to_datetime(
-                path_df_loaded["Date"] + " " + path_df_loaded[time_col_to_use],
-                errors="coerce" 
-            )
-            path_df_loaded.dropna(subset=["DateTime"], inplace=True)
-
-            if path_df_loaded.empty:
-                st.warning("No valid DateTime entries found in Path data after parsing.")
-            else:
-                cols_to_keep = ["Asset No.", "DateTime", "Distance Traveled(Miles)", "Lat", "Lon"]
-                if "Route" in path_df_loaded.columns:
-                    path_df_loaded["Route"] = path_df_loaded["Route"].astype(str).fillna("Unassigned")
-                    cols_to_keep.append("Route")
-                
-                path_df_loaded["Asset No."] = path_df_loaded["Asset No."].astype("category")
-                path_df_loaded["Lat"] = path_df_loaded["Lat"].astype("float64")
-                path_df_loaded["Lon"] = path_df_loaded["Lon"].astype("float64")
-                path_df_loaded["Distance Traveled(Miles)"] = path_df_loaded["Distance Traveled(Miles)"].astype("float32")
-                
-                st.session_state["raw_path_df"] = path_df_loaded.sort_values(["Asset No.", "DateTime"]).reset_index(drop=True)[cols_to_keep]
-                st.success(f"Loaded {len(st.session_state['raw_path_df'])} path records.")
-        except Exception as e:
-            st.error(f"Error loading path CSV: {e}")
-            st.session_state["path_df"] = pd.DataFrame() 
-            st.session_state["raw_path_df"] = pd.DataFrame()
-
-
-    if not st.session_state.get("raw_path_df", pd.DataFrame()).empty:
+    # --- DATE FILTERING LOGIC (remains mostly the same) ---
+    if not st.session_state.raw_path_df.empty:
         path_df_for_filtering = st.session_state["raw_path_df"]
         min_dt_available = path_df_for_filtering["DateTime"].min().date()
         max_dt_available = path_df_for_filtering["DateTime"].max().date()
 
-        if st.session_state.start_date_filter is None or not isinstance(st.session_state.start_date_filter, date):
+        if st.session_state.start_date_filter is None:
             st.session_state.start_date_filter = min_dt_available
-        if st.session_state.end_date_filter is None or not isinstance(st.session_state.end_date_filter, date):
+        if st.session_state.end_date_filter is None:
             st.session_state.end_date_filter = max_dt_available
         
         current_start_date = max(min(st.session_state.start_date_filter, max_dt_available), min_dt_available)
         current_end_date = max(min(st.session_state.end_date_filter, max_dt_available), min_dt_available)
-        if current_start_date > current_end_date: 
-            current_start_date, current_end_date = current_end_date, current_start_date
-
-
+        
         st.sidebar.markdown("**Filter Zonar Data by Date Range:**")
         s_filt = st.sidebar.date_input("Start date", value=current_start_date, min_value=min_dt_available, max_value=max_dt_available)
         e_filt = st.sidebar.date_input("End date", value=current_end_date, min_value=min_dt_available, max_value=max_dt_available)
@@ -622,18 +764,17 @@ def main():
                 st.session_state["path_df"] = path_df_for_filtering[
                     (path_df_for_filtering["DateTime"] >= start_datetime) &
                     (path_df_for_filtering["DateTime"] <= end_datetime)
-                ].copy() 
-                if st.session_state["path_df"].empty:
-                    st.sidebar.warning("Path data is empty after date filtering.")
-                else:
-                    st.sidebar.success(f"{len(st.session_state['path_df'])} records after date filter.")
+                ].copy()
+                st.sidebar.success(f"{len(st.session_state['path_df'])} records after date filter.")
             else:
-                st.sidebar.error("Start date cannot be after end date. No date filter applied.")
-                st.session_state["path_df"] = path_df_for_filtering.copy() 
+                st.sidebar.error("Start date cannot be after end date.")
+                st.session_state["path_df"] = pd.DataFrame()
     else:
-         st.session_state["path_df"] = pd.DataFrame() 
+         st.session_state["path_df"] = pd.DataFrame()
 
-
+    # --- REST OF THE APP LOGIC ---
+    # The rest of your main function continues from here, using the dataframes
+    # that are now safely loaded and stored in st.session_state.
     stops_ui = st.session_state.stops_df
     path_analysis_df = st.session_state.path_df
 
@@ -750,14 +891,7 @@ def main():
                 
                 st.session_state["processed_results"] = final_df.reset_index(drop=True)
     
-    elif (stops_file or not st.session_state.stops_df.empty) and \
-         (path_file or not st.session_state.get("raw_path_df", pd.DataFrame()).empty) and \
-         (st.session_state.path_df.empty):
-        st.info("Path data is currently empty, likely due to date filtering. Adjust date range or upload new data.")
-    elif not (stops_file or path_file):
-        st.info("Please upload Stops and Zonar Path data CSV files to begin analysis.")
-
-
+    #... [The rest of your display logic follows] ...
     # --- NEW: ROUTE FILTER AND DISPLAY LOGIC ---
     display_df_final = pd.DataFrame() # Initialize empty dataframe
     processed_df = st.session_state.get("processed_results", pd.DataFrame())
@@ -936,136 +1070,6 @@ def main():
                 st.write("No trips available in the filtered data for map selection.")
         elif google_maps_api_key: 
              st.write("No filtered trip data available to display on the map.")
-
-
-def _check_empty_and_stop(df: pd.DataFrame, filter_name: str) -> bool:
-    """Checks if DataFrame is empty after a filter, warns, clears session state, and stops if so."""
-    if df.empty:
-        st.warning(f"All trips removed by {filter_name} filter.")
-        st.session_state["processed_results"] = pd.DataFrame() 
-        st.stop() 
-        return True
-    return False
-
-def _safe_round(val, decimals=2):
-    if isinstance(val, (int, float, np.number)): 
-        if pd.notnull(val): 
-            return round(float(val), decimals)
-        else: 
-            return "N/A" 
-    elif pd.isna(val): 
-            return "N/A"
-    return "N/A" 
-
-
-def _plot_dist(df: pd.DataFrame, col_name: str, title_x: str, base_title: str):
-    if col_name in df.columns:
-        data_to_plot = df[[col_name]].dropna()
-        if not data_to_plot.empty:
-            st.write(f"#### Distribution of {base_title}")
-            try:
-                chart = alt.Chart(data_to_plot).mark_bar().encode(
-                    alt.X(f"{col_name}:Q", bin=alt.Bin(maxbins=30), title=title_x, type="quantitative"),
-                    alt.Y('count()', title="Number of Trips", type="quantitative")
-                ).properties(height=300, title=f"{base_title} Distribution")
-                st.altair_chart(chart, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error generating distribution plot for {base_title}: {e}")
-        else:
-            st.write(f"Not enough valid data for {base_title} distribution plot.")
-    else:
-        st.write(f"Column '{col_name}' not found for {base_title} distribution plot.")
-
-
-def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X):
-    required_cols = ["Time of Day Numeric", y_col, "O_Depart_DT", "Vehicle no.", "Time of Day Label"]
-    if all(col in df.columns for col in required_cols):
-        subset_df_scatter = df.copy()
-        if not pd.api.types.is_numeric_dtype(subset_df_scatter[y_col]):
-            subset_df_scatter[y_col] = pd.to_numeric(subset_df_scatter[y_col], errors='coerce')
-        
-        subset_df_scatter.dropna(subset=required_cols, inplace=True) 
-        
-        if not subset_df_scatter.empty:
-            # Section title
-            st.write(f"#### {y_title} vs. Time of Day")
-
-            # --- Calculate Rolling Mean Statistics ---
-            # Sort by time of day for proper rolling calculation
-            subset_df_scatter = subset_df_scatter.sort_values("Time of Day Numeric")
-            
-            # Calculate rolling mean with a window size (adjust as needed)
-            window_size = max(5, len(subset_df_scatter) // 10)  # Dynamic window size, minimum 5
-            subset_df_scatter['rolling_mean'] = subset_df_scatter[y_col].rolling(
-                window=window_size, center=True, min_periods=1
-            ).mean()
-
-            # Display rolling mean statistics
-            st.markdown("**Rolling Mean Statistics:**")
-            stat_col1, stat_col2, stat_col3 = st.columns(3)
-            stat_col1.metric(label="Window Size", value=f"{window_size}")
-            stat_col2.metric(label="Mean Value", value=f"{subset_df_scatter[y_col].mean():.4f}")
-            stat_col3.metric(label="Std Deviation", value=f"{subset_df_scatter[y_col].std():.4f}")
-            # --- End of Statistics Calculation and Display ---
-
-            # Tooltip for individual scatter points (remains the same)
-            point_tooltip_items = [
-                alt.Tooltip("Vehicle no.:N", title="Vehicle No."),
-                alt.Tooltip(f"{y_col}:Q", title=y_title, format=",.2f"),
-                alt.Tooltip("Time of Day Label:N", title="Time of Day (Adjusted)"),
-                alt.Tooltip("O_Depart_DT:T", title="Departure Timestamp", format='%m/%d/%Y %I:%M:%S %p')
-            ]
-            for idle_col_name, idle_title_tooltip in [
-                ("Origin Stop Idle (mins)", "Origin Idle (mins)"),
-                ("Destination Stop Idle (mins)", "Dest. Idle (mins)")]:
-                if idle_col_name in subset_df_scatter.columns and y_col != idle_col_name:
-                    if pd.api.types.is_numeric_dtype(subset_df_scatter[idle_col_name]):
-                        point_tooltip_items.append(alt.Tooltip(f"{idle_col_name}:Q", title=idle_title_tooltip, format=",.2f"))
-
-            # Add rolling mean to tooltip
-            rolling_tooltip_items = point_tooltip_items + [
-                alt.Tooltip("rolling_mean:Q", title="Rolling Mean", format=",.2f")
-            ]
-
-            try:
-                # Base chart definition
-                base = alt.Chart(subset_df_scatter).encode(
-                    x=x_axis, 
-                    y=alt.Y(f"{y_col}:Q", title=y_title, scale=alt.Scale(zero=False)) 
-                )
-
-                # Scatter plot points
-                points = base.mark_circle(size=60, opacity=0.7).encode(
-                    tooltip=point_tooltip_items,
-                    color=alt.Color("Vehicle no.:N", legend=None) 
-                ).interactive() 
-
-                # Rolling mean line (replaces regression line)
-                rolling_line = alt.Chart(subset_df_scatter).mark_line(
-                    color="red", 
-                    strokeWidth=3,
-                    opacity=0.8
-                ).encode(
-                    x=x_axis,
-                    y=alt.Y("rolling_mean:Q", title=y_title),
-                    tooltip=rolling_tooltip_items
-                )
-
-                # Combine scatter plot and rolling mean line
-                chart = (points + rolling_line).properties(
-                    height=400,
-                    title=f"Chart: {y_title} vs. Origin Departure Time (with Rolling Mean)" 
-                )
-                
-                st.altair_chart(chart, use_container_width=True)
-
-            except Exception as e:
-                 st.error(f"Error generating scatter plot for {y_title}: {e}")
-        else:
-            st.write(f"Not enough valid data for '{y_title} vs. Time of Day' scatter plot (after dropping NaNs).")
-    else:
-        missing = [col for col in required_cols if col not in df.columns]
-
 
 if __name__ == "__main__":
     main()
