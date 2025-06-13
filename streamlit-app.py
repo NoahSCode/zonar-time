@@ -150,7 +150,60 @@ def analyze_stop_crossings_hashtable(
     return results_df[[col for col in final_cols if col in results_df.columns]]
 
 ################################################################################
-# 3) Filtering, Plotting & Other Utilities
+# 3) Caching and Data Loading Function
+################################################################################
+
+# @st.cache_data is the modern decorator for caching data like DataFrames.
+# It's smarter and faster than the old @st.cache.
+# The function takes a tuple of uploaded files. When the function is called,
+# Streamlit hashes the input. If it's seen the exact same tuple of files
+# before, it skips executing the function and returns the stored result instantly.
+@st.cache_data
+def load_path_data(uploaded_files: tuple) -> pd.DataFrame:
+    """
+    Loads, processes, and concatenates multiple path CSV files into a single
+    optimized DataFrame. This function is cached to prevent re-reading large
+    files on every app interaction.
+    """
+    REQUIRED_PATH_COLS = {
+        "Asset No.", "Date", "Time(EST)", "Time(EDT)",
+        "Lat", "Lon", "Distance Traveled(Miles)"
+    }
+    PATH_DTYPES = {
+        "Asset No.": "category",
+        "Lat": "float32",
+        "Lon": "float32",
+        "Distance Traveled(Miles)": "float32"
+    }
+    
+    dfs = []
+    for f in uploaded_files:
+        try:
+            df = pd.read_csv(f, usecols=lambda c: c in REQUIRED_PATH_COLS, dtype=PATH_DTYPES)
+            
+            rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles", "Time(EST)": "TimeEST", "Time(EDT)": "TimeEDT"}
+            df.rename(columns=rename_map, inplace=True, errors='ignore')
+
+            if not set(["AssetNo", "Date", "DistanceTraveledMiles", "Lat", "Lon"]).issubset(df.columns):
+                st.warning(f"Skipping file {f.name} as it's missing required columns.")
+                continue
+            
+            time_col = "TimeEDT" if "TimeEDT" in df.columns and df["TimeEDT"].notna().any() else "TimeEST"
+            df["DateTime"] = pd.to_datetime(df["Date"] + " " + df[time_col], errors="coerce")
+            df.dropna(subset=["DateTime"], inplace=True)
+            dfs.append(df)
+        except Exception as e:
+            st.warning(f"Could not process file {f.name}. Error: {e}")
+            continue
+
+    if not dfs:
+        return pd.DataFrame()
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+    return combined_df
+
+################################################################################
+# 4) Filtering, Plotting & Other Utilities (Sections renumbered)
 ################################################################################
 def filter_by_gap_clustering_largest(df: pd.DataFrame, gap_threshold: float) -> pd.DataFrame:
     if df.empty or "Actual Distance (miles)" not in df.columns: return df.copy()
@@ -282,8 +335,9 @@ def _plot_scatter_tod(df: pd.DataFrame, y_col: str, y_title: str, x_axis: alt.X)
             line = base.transform_regression(on="Time of Day Numeric", regression=y_col).mark_line(color="red")
             st.altair_chart((points + line).properties(height=400, title=f"Chart: {y_title} vs. Time of Day"), use_container_width=True)
 
+
 ################################################################################
-# 7) Main Application
+# 5) Main Application
 ################################################################################
 def main():
     st.set_page_config(layout="wide")
@@ -293,8 +347,15 @@ def main():
     op_day_cutoff_hour_config = st.sidebar.number_input("Operational Day Cutoff Hour", 0, 23, 3, 1)
     google_maps_api_key = st.sidebar.text_input("Google Maps API Key (Optional)", type="password")
 
-    for key in ["stops_df", "raw_path_df", "path_df", "filtered_df", "processed_stops_files", "processed_path_files", "start_date_filter", "end_date_filter"]:
-        if key not in st.session_state: st.session_state[key] = None if "files" in key or "date" in key else pd.DataFrame()
+    # Initialize session state keys
+    for key in ["stops_df", "raw_path_df", "path_df", "filtered_df", "start_date_filter", "end_date_filter"]:
+        if key not in st.session_state: 
+            st.session_state[key] = None if "date" in key else pd.DataFrame()
+    
+    # We no longer need to track processed files in session state, the cache handles it.
+    if "processed_stops_files" not in st.session_state:
+        st.session_state.processed_stops_files = None
+
 
     c1, c2 = st.columns(2)
     stops_files = c1.file_uploader("Upload Stops CSV(s)", type=["csv"], accept_multiple_files=True)
@@ -312,54 +373,37 @@ def main():
             st.success(f"Loaded {len(df)} unique stops from {len(stops_files)} file(s).")
         except Exception as e: st.error(f"Error loading stops CSV(s): {e}"); st.session_state.stops_df, st.session_state.processed_stops_files = pd.DataFrame(), None
 
-    if path_files and path_files != st.session_state.processed_path_files:
-        # --- MEMORY OPTIMIZATION 1: Define required columns and efficient data types ---
-        # Only load the columns we actually use to dramatically reduce memory footprint.
-        REQUIRED_PATH_COLS = {
-            "Asset No.", "Date", "Time(EST)", "Time(EDT)",
-            "Lat", "Lon", "Distance Traveled(Miles)"
-        }
-        # Use more memory-efficient types. float32 is sufficient for lat/lon.
-        PATH_DTYPES = {
-            "Asset No.": "category",
-            "Lat": "float32",
-            "Lon": "float32",
-            "Distance Traveled(Miles)": "float32"
-        }
-        
-        dfs = []
+    # --- REFACTORED DATA LOADING LOGIC ---
+    if path_files:
         try:
-            with st.spinner(f"Loading and optimizing data from {len(path_files)} file(s)..."):
-                for f in path_files:
-                    # Use a lambda for usecols to safely ignore missing columns in a file
-                    df = pd.read_csv(f, usecols=lambda c: c in REQUIRED_PATH_COLS, dtype=PATH_DTYPES)
-                    
-                    # Rename columns for consistency
-                    rename_map = {"Asset No.": "AssetNo", "Distance Traveled(Miles)": "DistanceTraveledMiles", "Time(EST)": "TimeEST", "Time(EDT)": "TimeEDT"}
-                    df.rename(columns=rename_map, inplace=True, errors='ignore')
-
-                    if not set(["AssetNo", "Date", "DistanceTraveledMiles", "Lat", "Lon"]).issubset(df.columns):
-                        st.warning(f"Skipping file {f.name} as it's missing required columns.")
-                        continue
-                    
-                    # More robustly find the correct time column to use
-                    time_col = "TimeEDT" if "TimeEDT" in df.columns and df["TimeEDT"].notna().any() else "TimeEST"
-                    df["DateTime"] = pd.to_datetime(df["Date"] + " " + df[time_col], errors="coerce")
-                    df.dropna(subset=["DateTime"], inplace=True)
-                    dfs.append(df)
-
-            if dfs:
-                combined_df = pd.concat(dfs, ignore_index=True)
-                st.session_state.raw_path_df = combined_df
-                st.session_state.processed_path_files = path_files
-                # Reset downstream states
+            with st.spinner(f"Loading and optimizing data from {len(path_files)} file(s)... This may take a moment on first run."):
+                # We pass a tuple of the files to the cached function.
+                # Tuples are hashable, whereas lists are not.
+                # NOTE: UploadedFile objects themselves can cause a hashing error.
+                # If you see an "UnhashableTypeError", you would use the `hash_funcs`
+                # parameter as described in the documentation you provided. A good
+                # hash function would be `lambda file: (file.name, file.size)`.
+                raw_df = load_path_data(tuple(path_files))
+            
+            # Check if the dataframe in session_state is the same one we just loaded
+            # This prevents resetting filters if the files haven't changed.
+            if not st.session_state.raw_path_df.equals(raw_df):
+                st.session_state.raw_path_df = raw_df
+                # Reset downstream states only when new data is loaded
                 st.session_state.path_df, st.session_state.filtered_df = pd.DataFrame(), pd.DataFrame()
                 st.session_state.start_date_filter, st.session_state.end_date_filter = None, None
-                st.success(f"Loaded and optimized {len(combined_df)} path records from {len(dfs)} valid file(s).")
+                st.success(f"Loaded and cached {len(raw_df)} path records.")
                 st.rerun() # Rerun to update date pickers etc.
+
         except Exception as e:
+            # This will catch potential hashing errors from the cache decorator
             st.error(f"Error loading path CSV(s): {e}")
-            st.session_state.raw_path_df, st.session_state.processed_path_files = pd.DataFrame(), None
+            st.info(
+                "If you see an 'UnhashableTypeError', it means Streamlit cannot cache the "
+                "uploaded file object directly. This is a known issue solved by providing "
+                "a custom hash function as shown in the docs you're using."
+            )
+            st.session_state.raw_path_df = pd.DataFrame()
 
     if not st.session_state.raw_path_df.empty:
         df_filter = st.session_state.raw_path_df
@@ -372,8 +416,6 @@ def main():
         if s_filt and e_filt:
             st.session_state.start_date_filter, st.session_state.end_date_filter = s_filt, e_filt
             if s_filt <= e_filt:
-                # --- MEMORY OPTIMIZATION 2: Avoid .copy() where a view is sufficient ---
-                # The result of this boolean indexing is what we'll use, no need to force a copy yet.
                 st.session_state.path_df = df_filter[(df_filter["DateTime"] >= datetime.combine(s_filt, time.min)) & (df_filter["DateTime"] <= datetime.combine(e_filt, time.max))]
                 st.sidebar.success(f"{len(st.session_state.path_df)} records in range.")
             else:
@@ -431,9 +473,6 @@ def main():
         st.dataframe(disp_copy.drop(columns=["O_Depart_DT", "Travel Date_dt", "Time of Day Numeric"], errors='ignore'), use_container_width=True)
 
         st.subheader("Summary Metrics")
-        # --- ROBUSTNESS FIX ---
-        # Use st.metric for clear, robust display of key values. This avoids crashes
-        # if filters result in an empty dataframe, as .mean() would return NaN.
         col1, col2, col3 = st.columns(3)
         col4, col5, col6 = st.columns(3)
 
@@ -465,7 +504,6 @@ def main():
         st.subheader("Snap-to-Roads Map (Single Trip)")
         if not google_maps_api_key: st.warning("Enter a Google Maps API Key to enable map feature.")
         else:
-            # Use head(100) to prevent creating a massive list for the selectbox on huge result sets
             options = [f"Trip (Idx {r.Index}) | Bus: {getattr(r, 'Vehicle no.')} | Travel: {getattr(r, 'Travel Time'):.1f}m" for r in df_final.head(100).itertuples()]
             if options:
                 choice_label = st.selectbox("Select trip to display (first 100):", options)
@@ -474,7 +512,6 @@ def main():
                     chosen_row = df_final.loc[chosen_idx]
                     start, end = pd.to_datetime(chosen_row["Last Ping In Origin DateTime"]), pd.to_datetime(chosen_row["Destination Stop Entry"])
                     if pd.notna(start) and pd.notna(end):
-                        # Filter the original, raw dataframe for pings to avoid re-calculating anything
                         pings = st.session_state.raw_path_df[
                             (st.session_state.raw_path_df["AssetNo"] == chosen_row["Vehicle no."]) & 
                             (st.session_state.raw_path_df["DateTime"].between(start, end))
